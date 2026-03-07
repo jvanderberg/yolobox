@@ -2,7 +2,7 @@ use crate::cloud_init::{self, CloudInitOptions};
 use crate::git;
 use crate::network;
 use crate::runtime::{self, LaunchConfig, LaunchMode};
-use crate::state;
+use crate::state::{self, ShareMount};
 use std::env;
 use std::path::PathBuf;
 
@@ -35,6 +35,7 @@ enum Command {
 
 enum BaseCommand {
     Import(BaseImportOptions),
+    Capture(BaseCaptureOptions),
     List,
 }
 
@@ -46,6 +47,13 @@ struct Cli {
 struct BaseImportOptions {
     name: String,
     image: PathBuf,
+}
+
+#[derive(Clone)]
+struct BaseCaptureOptions {
+    name: String,
+    repo: String,
+    branch: String,
 }
 
 #[derive(Clone)]
@@ -66,6 +74,8 @@ struct LaunchOptions {
     ssh_pubkey: Option<PathBuf>,
     ssh_private_key: Option<PathBuf>,
     init_script: Option<PathBuf>,
+    shares: Option<Vec<ShareMount>>,
+    clear_shares: bool,
 }
 
 #[derive(Clone)]
@@ -127,6 +137,36 @@ fn parse_base(args: &[String]) -> Result<BaseCommand, String> {
                 image: image.ok_or_else(|| "base import requires --image".to_string())?,
             }))
         }
+        "capture" => {
+            let mut name = None;
+            let mut repo = None;
+            let mut branch = None;
+            let mut index = 0;
+            while index < rest.len() {
+                match rest[index].as_str() {
+                    "--name" => {
+                        index += 1;
+                        name = Some(expect_value(rest, index, "--name")?);
+                    }
+                    "--repo" => {
+                        index += 1;
+                        repo = Some(expect_value(rest, index, "--repo")?);
+                    }
+                    "--branch" => {
+                        index += 1;
+                        branch = Some(expect_value(rest, index, "--branch")?);
+                    }
+                    flag => return Err(format!("unknown flag for base capture: {flag}")),
+                }
+                index += 1;
+            }
+
+            Ok(BaseCommand::Capture(BaseCaptureOptions {
+                name: name.ok_or_else(|| "base capture requires --name".to_string())?,
+                repo: repo.ok_or_else(|| "base capture requires --repo".to_string())?,
+                branch: branch.ok_or_else(|| "base capture requires --branch".to_string())?,
+            }))
+        }
         "list" => Ok(BaseCommand::List),
         other => Err(format!("unknown base subcommand: {other}")),
     }
@@ -149,6 +189,9 @@ fn parse_launch(args: &[String]) -> Result<LaunchOptions, String> {
     let mut ssh_pubkey = None;
     let mut ssh_private_key = None;
     let mut init_script = None;
+    let mut shares = Vec::new();
+    let mut saw_share = false;
+    let mut clear_shares = false;
 
     let mut index = 0;
     while index < args.len() {
@@ -198,6 +241,12 @@ fn parse_launch(args: &[String]) -> Result<LaunchOptions, String> {
                 index += 1;
                 init_script = Some(PathBuf::from(expect_value(args, index, "--init-script")?));
             }
+            "--share" => {
+                index += 1;
+                saw_share = true;
+                shares.push(state::parse_share(&expect_value(args, index, "--share")?)?);
+            }
+            "--clear-shares" => clear_shares = true,
             "--cpus" => {
                 index += 1;
                 cpus = expect_value(args, index, "--cpus")?
@@ -232,6 +281,8 @@ fn parse_launch(args: &[String]) -> Result<LaunchOptions, String> {
         ssh_pubkey,
         ssh_private_key,
         init_script,
+        shares: saw_share.then_some(shares),
+        clear_shares,
     })
 }
 
@@ -270,6 +321,20 @@ fn base(command: BaseCommand) -> Result<(), String> {
             }
             Ok(())
         }
+        BaseCommand::Capture(options) => {
+            let instance = state::find_instance(&options.repo, &options.branch)?.ok_or_else(|| {
+                format!(
+                    "no instance found for {} {}",
+                    options.repo, options.branch
+                )
+            })?;
+            runtime::stop_instance_vm(&instance.instance_dir)?;
+            let image = state::import_base_image(&options.name, &instance.rootfs_path)?;
+            for line in image.summary_lines() {
+                println!("{line}");
+            }
+            Ok(())
+        }
         BaseCommand::List => {
             let images = state::list_base_images()?;
             if images.is_empty() {
@@ -294,12 +359,24 @@ fn launch(options: LaunchOptions) -> Result<(), String> {
     if options.vm && options.shell_only {
         return Err("--vm and --shell are mutually exclusive".to_string());
     }
+    if options.clear_shares && options.shares.is_some() {
+        return Err("--clear-shares and --share are mutually exclusive".to_string());
+    }
     if !options.cloud_init && options.init_script.is_some() {
         return Err("--init-script requires cloud-init; remove --no-cloud-init".to_string());
     }
 
     let plan = runtime::resolve_runtime(options.shell_only);
-    let instance = state::ensure_instance(&options.repo, &options.branch, options.base.as_deref())?;
+    let instance = state::ensure_instance(
+        &options.repo,
+        &options.branch,
+        options.base.as_deref(),
+        if options.clear_shares {
+            Some(&[])
+        } else {
+            options.shares.as_deref()
+        },
+    )?;
     let vmnet = match plan.mode {
         LaunchMode::Krunkit => Some(network::resolve_for_instance(&instance)?),
         _ => None,
@@ -313,6 +390,7 @@ fn launch(options: LaunchOptions) -> Result<(), String> {
                 hostname: options.hostname.clone(),
                 ssh_pubkey: options.ssh_pubkey.clone(),
                 init_script: options.init_script.clone(),
+                shares: instance.shares.clone(),
                 network: vmnet.clone(),
             },
         )?,
@@ -363,6 +441,7 @@ fn launch(options: LaunchOptions) -> Result<(), String> {
         init_script_path: prepared_cloud_init
             .as_ref()
             .and_then(|prepared| prepared.init_script_path.clone()),
+        shares: instance.shares.clone(),
         vmnet,
     };
 
@@ -481,10 +560,11 @@ fn print_usage() {
     println!();
     println!("Commands:");
     println!("  base import --name <base> --image <path>");
+    println!("  base capture --name <base> --repo <url> --branch <name>");
     println!("  base list");
     println!("  doctor");
     println!(
-        "  launch --repo <url> --branch <name> [--base <base>] [--new-branch] [--from <base-branch>] [--shell] [--cpus <count>] [--memory-mib <size>] [--cloud-user <name>] [--hostname <name>] [--ssh-pubkey <path>] [--init-script <path>] [--no-cloud-init] [--no-enter]"
+        "  launch --repo <url> --branch <name> [--base <base>] [--new-branch] [--from <base-branch>] [--shell] [--cpus <count>] [--memory-mib <size>] [--cloud-user <name>] [--hostname <name>] [--ssh-pubkey <path>] [--init-script <path>] [--share <host_path>:<guest_path>] [--clear-shares] [--no-cloud-init] [--no-enter]"
     );
     println!("  launch ... [--ssh-private-key <path>]");
     println!("  status --repo <url> --branch <name>");

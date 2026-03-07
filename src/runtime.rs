@@ -1,6 +1,6 @@
 use crate::network::VmnetConfig;
 use crate::ports::PortMapping;
-use crate::state::Instance;
+use crate::state::{Instance, ShareMount};
 use std::env;
 use std::fs;
 use std::fs::File;
@@ -35,6 +35,7 @@ pub struct LaunchConfig {
     pub ssh_pubkey_path: Option<PathBuf>,
     pub ssh_private_key_path: Option<PathBuf>,
     pub init_script_path: Option<PathBuf>,
+    pub shares: Vec<ShareMount>,
     pub vmnet: Option<VmnetConfig>,
 }
 
@@ -170,6 +171,7 @@ fn launch_shell(instance: &Instance) -> Result<i32, String> {
         .env("VIBEBOX_BASE_IMAGE_ID", &instance.base_image_id)
         .env("VIBEBOX_ROOTFS", &instance.rootfs_path)
         .env("VIBEBOX_BRANCH", &instance.branch)
+        .env("VIBEBOX_SHARES", encode_env_shares(&instance.shares))
         .env("VIBEBOX_PORTS", encode_env_ports(&instance.ports))
         .status()
         .map_err(|err| err.to_string())?;
@@ -210,6 +212,7 @@ fn launch_external(
             "VIBEBOX_HOSTNAME",
             config.hostname.as_deref().unwrap_or_default(),
         )
+        .env("VIBEBOX_SHARES", encode_env_shares(&config.shares))
         .env("VIBEBOX_PORTS", encode_env_ports(&instance.ports));
 
     if let Some(vmnet) = &config.vmnet {
@@ -249,23 +252,35 @@ fn launch_krunkit(instance: &Instance, config: &LaunchConfig) -> Result<i32, Str
     let krunkit_log = runtime_dir.join("krunkit.log");
     let pidfile = runtime_dir.join("krunkit.pid");
     let known_hosts = runtime_dir.join("known_hosts");
+    let shares_path = runtime_dir.join("shares");
 
     if instance_has_running_vm(&instance.instance_dir)? {
-        eprintln!("reconnecting to running vm for {}", instance.id);
-        if wait_for_running_vm_ssh(
-            &instance.instance_dir,
-            ssh_user,
-            ssh_private_key,
-            &known_hosts,
-            vmnet,
-        )? {
-            return connect_ssh(instance, ssh_user, ssh_private_key, &known_hosts, vmnet);
-        }
+        if running_vm_matches_shares(&shares_path, &config.shares)? {
+            eprintln!("reconnecting to running vm for {}", instance.id);
+            if wait_for_running_vm_ssh(
+                &instance.instance_dir,
+                ssh_user,
+                ssh_private_key,
+                &known_hosts,
+                vmnet,
+            )? {
+                return connect_ssh(
+                    instance,
+                    ssh_user,
+                    ssh_private_key,
+                    &known_hosts,
+                    vmnet,
+                    &config.shares,
+                );
+            }
 
-        eprintln!(
-            "running vm for {} did not accept ssh within timeout, restarting it",
-            instance.id
-        );
+            eprintln!(
+                "running vm for {} did not accept ssh within timeout, restarting it",
+                instance.id
+            );
+        } else {
+            eprintln!("share configuration changed for {}, restarting vm", instance.id);
+        }
     }
 
     // Relaunches can leave vmnet-client orphaned even after krunkit exits.
@@ -273,6 +288,7 @@ fn launch_krunkit(instance: &Instance, config: &LaunchConfig) -> Result<i32, Str
     stop_instance_vm(&instance.instance_dir)?;
     stop_vmnet_helper_interface(&vmnet.interface_id)?;
     remove_if_exists(&known_hosts)?;
+    write_runtime_shares(&shares_path, &config.shares)?;
 
     let stdout_file = File::create(&krunkit_log).map_err(|err| err.to_string())?;
     let stderr_file = stdout_file.try_clone().map_err(|err| err.to_string())?;
@@ -318,7 +334,15 @@ fn launch_krunkit(instance: &Instance, config: &LaunchConfig) -> Result<i32, Str
             "virtio-fs,sharedDir={},mountTag={}",
             instance.checkout_dir.display(),
             DEFAULT_WORKSPACE_TAG
-        ))
+        ));
+    for (index, share) in config.shares.iter().enumerate() {
+        command.arg("--device").arg(format!(
+            "virtio-fs,sharedDir={},mountTag={}",
+            share.host_path.display(),
+            share_tag(index)
+        ));
+    }
+    command
         .arg("--device")
         .arg(format!(
             "virtio-serial,logFilePath={}",
@@ -348,7 +372,14 @@ fn launch_krunkit(instance: &Instance, config: &LaunchConfig) -> Result<i32, Str
         ));
     }
 
-    connect_ssh(instance, ssh_user, ssh_private_key, &known_hosts, vmnet)
+    connect_ssh(
+        instance,
+        ssh_user,
+        ssh_private_key,
+        &known_hosts,
+        vmnet,
+        &config.shares,
+    )
 }
 
 fn wait_for_ssh(
@@ -438,6 +469,7 @@ fn connect_ssh(
     ssh_private_key: &Path,
     known_hosts: &Path,
     vmnet: &VmnetConfig,
+    shares: &[ShareMount],
 ) -> Result<i32, String> {
     let mut command = ssh_base_command(ssh_user, ssh_private_key, known_hosts, vmnet);
     for mapping in &instance.ports {
@@ -448,7 +480,7 @@ fn connect_ssh(
     command
         .arg("-tt")
         .arg(format!("{ssh_user}@{}", vmnet.guest_ip))
-        .arg(guest_shell_command());
+        .arg(guest_shell_command(shares));
 
     let status = command.status().map_err(|err| err.to_string())?;
     Ok(status.code().unwrap_or_default())
@@ -458,8 +490,19 @@ fn krunkit_network_device(mac_address: &str) -> String {
     format!("virtio-net,type=unixgram,fd=4,mac={mac_address}")
 }
 
-fn guest_shell_command() -> &'static str {
-    "bash -lc 'if command -v cloud-init >/dev/null 2>&1; then CLOUD_INIT_STATUS=\"$(sudo cloud-init status 2>/dev/null || true)\"; if ! printf \"%s\" \"$CLOUD_INIT_STATUS\" | grep -q \"status: done\"; then echo \"waiting for cloud-init/bootstrap...\"; if sudo test -e /var/log/vibebox-init.log; then sudo sh -lc \"tail -n +1 -F /var/log/vibebox-init.log\" & TAIL_PID=$!; fi; sudo cloud-init status --wait >/dev/null 2>&1 || true; if [ -n \"${TAIL_PID:-}\" ]; then kill \"$TAIL_PID\" 2>/dev/null || true; wait \"$TAIL_PID\" 2>/dev/null || true; fi; echo \"cloud-init/bootstrap complete\"; fi; if sudo test -f /var/lib/vibebox/init.done && sudo test -f /var/log/vibebox-init.log && ! sudo test -f /var/lib/vibebox/init-log-shown; then echo \"bootstrap log:\"; sudo cat /var/log/vibebox-init.log; sudo touch /var/lib/vibebox/init-log-shown; fi; fi; ROOT_DEV=\"$(findmnt -n -o SOURCE / 2>/dev/null || true)\"; ROOT_FS=\"$(findmnt -n -o FSTYPE / 2>/dev/null || true)\"; if command -v growpart >/dev/null 2>&1 && [ -n \"$ROOT_DEV\" ]; then PARENT_DEV=\"/dev/$(lsblk -no PKNAME \"$ROOT_DEV\" 2>/dev/null || true)\"; PART_NUM=\"$(lsblk -no PARTN \"$ROOT_DEV\" 2>/dev/null || true)\"; if [ -n \"$PARENT_DEV\" ] && [ -n \"$PART_NUM\" ]; then sudo growpart \"$PARENT_DEV\" \"$PART_NUM\" >/dev/null 2>&1 || true; fi; fi; if [ -n \"$ROOT_DEV\" ]; then case \"$ROOT_FS\" in ext2|ext3|ext4) if command -v resize2fs >/dev/null 2>&1; then sudo resize2fs \"$ROOT_DEV\" >/dev/null 2>&1 || true; fi ;; xfs) if command -v xfs_growfs >/dev/null 2>&1; then sudo xfs_growfs / >/dev/null 2>&1 || true; fi ;; esac; fi; if [ -e /workspace ] && [ ! -d /workspace ]; then sudo rm -f /workspace; fi; sudo mkdir -p /workspace; if ! mountpoint -q /workspace; then sudo mount -t virtiofs workspace /workspace >/dev/null 2>&1 || true; fi; ln -sfn /workspace \"$HOME/workspace\"; cd /workspace 2>/dev/null || cd \"$HOME\"; exec /bin/bash -l'"
+fn guest_shell_command(shares: &[ShareMount]) -> String {
+    let mut share_mounts = String::new();
+    for (index, share) in shares.iter().enumerate() {
+        let path = shell_quote(&share.guest_path.display().to_string());
+        share_mounts.push_str(&format!(
+            " if [ -e {path} ] && [ ! -d {path} ]; then sudo rm -f {path}; fi; sudo mkdir -p {path}; if ! mountpoint -q {path}; then sudo mount -t virtiofs {} {path} >/dev/null 2>&1 || true; fi;",
+            share_tag(index)
+        ));
+    }
+
+    format!(
+        "bash -lc 'if command -v cloud-init >/dev/null 2>&1; then CLOUD_INIT_STATUS=\"$(sudo cloud-init status 2>/dev/null || true)\"; if ! printf \"%s\" \"$CLOUD_INIT_STATUS\" | grep -q \"status: done\"; then echo \"waiting for cloud-init/bootstrap...\"; if sudo test -e /var/log/vibebox-init.log; then sudo sh -lc \"tail -n +1 -F /var/log/vibebox-init.log\" & TAIL_PID=$!; fi; sudo cloud-init status --wait >/dev/null 2>&1 || true; if [ -n \"${{TAIL_PID:-}}\" ]; then kill \"$TAIL_PID\" 2>/dev/null || true; wait \"$TAIL_PID\" 2>/dev/null || true; fi; echo \"cloud-init/bootstrap complete\"; fi; if sudo test -f /var/lib/vibebox/init.done && sudo test -f /var/log/vibebox-init.log && ! sudo test -f /var/lib/vibebox/init-log-shown; then echo \"bootstrap log:\"; sudo cat /var/log/vibebox-init.log; sudo touch /var/lib/vibebox/init-log-shown; fi; fi; ROOT_DEV=\"$(findmnt -n -o SOURCE / 2>/dev/null || true)\"; ROOT_FS=\"$(findmnt -n -o FSTYPE / 2>/dev/null || true)\"; if command -v growpart >/dev/null 2>&1 && [ -n \"$ROOT_DEV\" ]; then PARENT_DEV=\"/dev/$(lsblk -no PKNAME \"$ROOT_DEV\" 2>/dev/null || true)\"; PART_NUM=\"$(lsblk -no PARTN \"$ROOT_DEV\" 2>/dev/null || true)\"; if [ -n \"$PARENT_DEV\" ] && [ -n \"$PART_NUM\" ]; then sudo growpart \"$PARENT_DEV\" \"$PART_NUM\" >/dev/null 2>&1 || true; fi; fi; if [ -n \"$ROOT_DEV\" ]; then case \"$ROOT_FS\" in ext2|ext3|ext4) if command -v resize2fs >/dev/null 2>&1; then sudo resize2fs \"$ROOT_DEV\" >/dev/null 2>&1 || true; fi ;; xfs) if command -v xfs_growfs >/dev/null 2>&1; then sudo xfs_growfs / >/dev/null 2>&1 || true; fi ;; esac; fi; if [ -e /workspace ] && [ ! -d /workspace ]; then sudo rm -f /workspace; fi; sudo mkdir -p /workspace; if ! mountpoint -q /workspace; then sudo mount -t virtiofs workspace /workspace >/dev/null 2>&1 || true; fi;{share_mounts} ln -sfn /workspace \"$HOME/workspace\"; cd /workspace 2>/dev/null || cd \"$HOME\"; exec /bin/bash -l'"
+    )
 }
 
 fn ssh_base_command(
@@ -713,6 +756,34 @@ fn encode_env_ports(ports: &[PortMapping]) -> String {
         .join(",")
 }
 
+fn encode_env_shares(shares: &[ShareMount]) -> String {
+    shares
+        .iter()
+        .map(|share| format!("{}:{}", share.host_path.display(), share.guest_path.display()))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn write_runtime_shares(path: &Path, shares: &[ShareMount]) -> Result<(), String> {
+    fs::write(path, encode_env_shares(shares)).map_err(|err| err.to_string())
+}
+
+fn running_vm_matches_shares(path: &Path, shares: &[ShareMount]) -> Result<bool, String> {
+    if !path.exists() {
+        return Ok(shares.is_empty());
+    }
+    let current = fs::read_to_string(path).map_err(|err| err.to_string())?;
+    Ok(current == encode_env_shares(shares))
+}
+
+fn share_tag(index: usize) -> String {
+    format!("share{index}")
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
 fn remove_if_exists(path: &Path) -> Result<(), String> {
     if path.exists() {
         fs::remove_file(path).map_err(|err| err.to_string())?;
@@ -724,10 +795,11 @@ fn remove_if_exists(path: &Path) -> Result<(), String> {
 mod tests {
     use super::{
         detect_runtime_failure, encode_env_ports, guest_shell_command, krunkit_network_device,
-        parse_instance_processes, parse_vmnet_helper_processes, ssh_ready_timeout,
-        stop_stale_vm,
+        parse_instance_processes, parse_vmnet_helper_processes, running_vm_matches_shares,
+        share_tag, ssh_ready_timeout, stop_stale_vm, write_runtime_shares,
     };
     use crate::ports::PortMapping;
+    use crate::state::ShareMount;
     use std::env;
     use std::fs;
     use std::path::PathBuf;
@@ -758,7 +830,10 @@ mod tests {
 
     #[test]
     fn guest_shell_waits_for_workspace_readiness() {
-        let command = guest_shell_command();
+        let command = guest_shell_command(&[ShareMount {
+            host_path: PathBuf::from("/tmp/share"),
+            guest_path: PathBuf::from("/mnt/share"),
+        }]);
         assert!(command.contains("cloud-init status --wait"));
         assert!(command.contains("waiting for cloud-init/bootstrap"));
         assert!(command.contains("/var/log/vibebox-init.log"));
@@ -768,6 +843,7 @@ mod tests {
         assert!(command.contains("resize2fs"));
         assert!(command.contains("rm -f /workspace"));
         assert!(command.contains("mount -t virtiofs workspace /workspace"));
+        assert!(command.contains(&format!("mount -t virtiofs {} '/mnt/share'", share_tag(0))));
         assert!(command.contains("cd /workspace"));
     }
 
@@ -837,5 +913,18 @@ mod tests {
         unsafe {
             env::remove_var("VIBEBOX_SSH_READY_TIMEOUT_SECS");
         }
+    }
+
+    #[test]
+    fn running_vm_matches_share_config_file() {
+        let path = PathBuf::from("/tmp/vibebox-shares-test");
+        let shares = vec![ShareMount {
+            host_path: PathBuf::from("/tmp/host"),
+            guest_path: PathBuf::from("/mnt/guest"),
+        }];
+        write_runtime_shares(&path, &shares).unwrap();
+        assert!(running_vm_matches_shares(&path, &shares).unwrap());
+        assert!(!running_vm_matches_shares(&path, &[]).unwrap());
+        let _ = fs::remove_file(&path);
     }
 }

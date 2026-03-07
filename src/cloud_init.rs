@@ -1,5 +1,5 @@
 use crate::network::VmnetConfig;
-use crate::state::Instance;
+use crate::state::{Instance, ShareMount};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -14,6 +14,7 @@ pub struct CloudInitOptions {
     pub hostname: Option<String>,
     pub ssh_pubkey: Option<PathBuf>,
     pub init_script: Option<PathBuf>,
+    pub shares: Vec<ShareMount>,
     pub network: Option<VmnetConfig>,
 }
 
@@ -126,7 +127,7 @@ pub fn prepare(
     let files_dir = cloud_init_dir.join("files");
     fs::create_dir_all(&files_dir).map_err(|err| err.to_string())?;
 
-    let user_data = render_user_data(&options.user, &ssh_pubkey, &hostname, host_uid);
+    let user_data = render_user_data(&options.user, &ssh_pubkey, &hostname, host_uid, &options.shares);
     let init_script_path = match &options.init_script {
         Some(path) => {
             if !path.is_file() {
@@ -139,6 +140,7 @@ pub fn prepare(
                 &ssh_pubkey,
                 &hostname,
                 host_uid,
+                &options.shares,
                 &script,
             );
             Some((path.clone(), rendered))
@@ -281,12 +283,21 @@ fn sanitize_hostname(input: &str) -> String {
     hostname.trim_matches('-').to_string()
 }
 
-fn render_user_data(user: &str, ssh_pubkey: &str, hostname: &str, host_uid: Option<u32>) -> String {
+fn render_user_data(
+    user: &str,
+    ssh_pubkey: &str,
+    hostname: &str,
+    host_uid: Option<u32>,
+    shares: &[ShareMount],
+) -> String {
     let uid_line = host_uid
         .map(|uid| format!("    uid: {uid}\n"))
         .unwrap_or_default();
+    let mounts = render_mounts(shares);
+    let bootcmd = render_bootcmd(shares);
+    let runcmd = render_runcmd(user, shares, false);
     format!(
-        "#cloud-config\npreserve_hostname: false\nhostname: {hostname}\nfqdn: {hostname}\ngrowpart:\n  mode: auto\n  devices: [\"/\"]\nresize_rootfs: true\nusers:\n  - default\n  - name: {user}\n{uid_line}    sudo: ALL=(ALL) NOPASSWD:ALL\n    groups: adm, sudo\n    shell: /bin/bash\n    lock_passwd: true\n    ssh_authorized_keys:\n      - {ssh_pubkey}\nssh_pwauth: false\ndisable_root: true\npackage_update: false\npackage_upgrade: false\nbootcmd:\n  - [ sh, -lc, \"if [ -e /workspace ] && [ ! -d /workspace ]; then rm -f /workspace; fi; mkdir -p /workspace\" ]\nmounts:\n  - [ workspace, /workspace, virtiofs, \"defaults,nofail\", \"0\", \"0\" ]\nruncmd:\n  - [ sh, -lc, \"if ! dpkg -s avahi-daemon >/dev/null 2>&1; then apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y avahi-daemon; fi\" ]\n  - [ systemctl, enable, --now, avahi-daemon ]\n  - [ sh, -lc, \"if [ -e /workspace ] && [ ! -d /workspace ]; then rm -f /workspace; fi; mkdir -p /workspace; mountpoint -q /workspace || mount /workspace || true\" ]\n  - [ ln, -sfn, /workspace, /home/{user}/workspace ]\n"
+        "#cloud-config\npreserve_hostname: false\nhostname: {hostname}\nfqdn: {hostname}\ngrowpart:\n  mode: auto\n  devices: [\"/\"]\nresize_rootfs: true\nusers:\n  - default\n  - name: {user}\n{uid_line}    sudo: ALL=(ALL) NOPASSWD:ALL\n    groups: adm, sudo\n    shell: /bin/bash\n    lock_passwd: true\n    ssh_authorized_keys:\n      - {ssh_pubkey}\nssh_pwauth: false\ndisable_root: true\npackage_update: false\npackage_upgrade: false\nbootcmd:\n{bootcmd}\nmounts:\n{mounts}\nruncmd:\n{runcmd}\n"
     )
 }
 
@@ -295,6 +306,7 @@ fn render_user_data_with_init_script(
     ssh_pubkey: &str,
     hostname: &str,
     host_uid: Option<u32>,
+    shares: &[ShareMount],
     init_script: &str,
 ) -> String {
     let uid_line = host_uid
@@ -308,12 +320,76 @@ if [ ! -f /var/lib/vibebox/init.done ]; then
   sudo touch /var/lib/vibebox/init.done
 fi
 "#;
+    let mounts = render_mounts(shares);
+    let bootcmd = render_bootcmd(shares);
+    let runcmd = render_runcmd(user, shares, true);
 
     format!(
-        "#cloud-config\npreserve_hostname: false\nhostname: {hostname}\nfqdn: {hostname}\ngrowpart:\n  mode: auto\n  devices: [\"/\"]\nresize_rootfs: true\nusers:\n  - default\n  - name: {user}\n{uid_line}    sudo: ALL=(ALL) NOPASSWD:ALL\n    groups: adm, sudo\n    shell: /bin/bash\n    lock_passwd: true\n    ssh_authorized_keys:\n      - {ssh_pubkey}\nssh_pwauth: false\ndisable_root: true\npackage_update: false\npackage_upgrade: false\nwrite_files:\n  - path: /var/lib/vibebox/init.sh\n    permissions: '0755'\n    owner: root:root\n    content: |\n{init_script_content}\n  - path: /var/lib/vibebox/run-init.sh\n    permissions: '0755'\n    owner: root:root\n    content: |\n{run_init_script_content}\nbootcmd:\n  - [ sh, -lc, \"if [ -e /workspace ] && [ ! -d /workspace ]; then rm -f /workspace; fi; mkdir -p /workspace\" ]\nruncmd:\n  - [ sh, -lc, \"if ! dpkg -s avahi-daemon >/dev/null 2>&1; then apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y avahi-daemon; fi\" ]\n  - [ systemctl, enable, --now, avahi-daemon ]\n  - [ sh, -lc, \"if [ -e /workspace ] && [ ! -d /workspace ]; then rm -f /workspace; fi; mkdir -p /workspace; mountpoint -q /workspace || mount /workspace || true\" ]\n  - [ sh, -lc, \"mkdir -p /var/lib/vibebox && touch /var/log/vibebox-init.log && chown {user}:{user} /var/log/vibebox-init.log\" ]\n  - [ su, -, {user}, -c, /var/lib/vibebox/run-init.sh ]\n  - [ ln, -sfn, /workspace, /home/{user}/workspace ]\n",
+        "#cloud-config\npreserve_hostname: false\nhostname: {hostname}\nfqdn: {hostname}\ngrowpart:\n  mode: auto\n  devices: [\"/\"]\nresize_rootfs: true\nusers:\n  - default\n  - name: {user}\n{uid_line}    sudo: ALL=(ALL) NOPASSWD:ALL\n    groups: adm, sudo\n    shell: /bin/bash\n    lock_passwd: true\n    ssh_authorized_keys:\n      - {ssh_pubkey}\nssh_pwauth: false\ndisable_root: true\npackage_update: false\npackage_upgrade: false\nwrite_files:\n  - path: /var/lib/vibebox/init.sh\n    permissions: '0755'\n    owner: root:root\n    content: |\n{init_script_content}\n  - path: /var/lib/vibebox/run-init.sh\n    permissions: '0755'\n    owner: root:root\n    content: |\n{run_init_script_content}\nbootcmd:\n{bootcmd}\nmounts:\n{mounts}\nruncmd:\n{runcmd}\n",
         init_script_content = indent_for_yaml(init_script, 6),
         run_init_script_content = indent_for_yaml(run_init_script, 6),
     )
+}
+
+fn render_mounts(shares: &[ShareMount]) -> String {
+    let mut lines = vec!["  - [ workspace, /workspace, virtiofs, \"defaults,nofail\", \"0\", \"0\" ]".to_string()];
+    for (index, share) in shares.iter().enumerate() {
+        lines.push(format!(
+            "  - [ {}, \"{}\", virtiofs, \"defaults,nofail\", \"0\", \"0\" ]",
+            share_tag(index),
+            yaml_escape(&share.guest_path.display().to_string())
+        ));
+    }
+    lines.join("\n")
+}
+
+fn render_bootcmd(shares: &[ShareMount]) -> String {
+    let mut lines = vec![
+        "  - [ sh, -lc, \"if [ -e /workspace ] && [ ! -d /workspace ]; then rm -f /workspace; fi; mkdir -p /workspace\" ]".to_string(),
+    ];
+    for share in shares {
+        let path = shell_quote(&share.guest_path.display().to_string());
+        lines.push(format!(
+            "  - [ sh, -lc, \"if [ -e {path} ] && [ ! -d {path} ]; then rm -f {path}; fi; mkdir -p {path}\" ]"
+        ));
+    }
+    lines.join("\n")
+}
+
+fn render_runcmd(user: &str, shares: &[ShareMount], includes_init_script: bool) -> String {
+    let mut lines = vec![
+        "  - [ sh, -lc, \"if ! dpkg -s avahi-daemon >/dev/null 2>&1; then apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y avahi-daemon; fi\" ]".to_string(),
+        "  - [ systemctl, enable, --now, avahi-daemon ]".to_string(),
+        "  - [ sh, -lc, \"if [ -e /workspace ] && [ ! -d /workspace ]; then rm -f /workspace; fi; mkdir -p /workspace; mountpoint -q /workspace || mount /workspace || true\" ]".to_string(),
+    ];
+    for share in shares {
+        let path = shell_quote(&share.guest_path.display().to_string());
+        lines.push(format!(
+            "  - [ sh, -lc, \"if [ -e {path} ] && [ ! -d {path} ]; then rm -f {path}; fi; mkdir -p {path}; mountpoint -q {path} || mount {path} || true\" ]"
+        ));
+    }
+    if includes_init_script {
+        lines.push(format!(
+            "  - [ sh, -lc, \"mkdir -p /var/lib/vibebox && touch /var/log/vibebox-init.log && chown {user}:{user} /var/log/vibebox-init.log\" ]"
+        ));
+        lines.push(format!(
+            "  - [ su, -, {user}, -c, /var/lib/vibebox/run-init.sh ]"
+        ));
+    }
+    lines.push(format!("  - [ ln, -sfn, /workspace, /home/{user}/workspace ]"));
+    lines.join("\n")
+}
+
+fn share_tag(index: usize) -> String {
+    format!("share{index}")
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn yaml_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn indent_for_yaml(content: &str, spaces: usize) -> String {
@@ -371,13 +447,13 @@ mod tests {
     };
     use crate::network::VmnetConfig;
     use crate::ports::PortMapping;
-    use crate::state::Instance;
+    use crate::state::{Instance, ShareMount};
     use std::env;
     use std::path::PathBuf;
 
     #[test]
     fn user_data_contains_user_and_key() {
-        let rendered = render_user_data("vibe", "ssh-ed25519 AAAATEST", "repo-main", Some(501));
+        let rendered = render_user_data("vibe", "ssh-ed25519 AAAATEST", "repo-main", Some(501), &[]);
         assert!(rendered.contains("preserve_hostname: false"));
         assert!(rendered.contains("hostname: repo-main"));
         assert!(rendered.contains("growpart:"));
@@ -406,6 +482,10 @@ mod tests {
             "ssh-ed25519 AAAATEST",
             "repo-main",
             Some(501),
+            &[ShareMount {
+                host_path: PathBuf::from("/tmp/host-share"),
+                guest_path: PathBuf::from("/mnt/share"),
+            }],
             "#!/bin/sh\necho init\n",
         );
         assert!(rendered.contains("write_files:"));
@@ -416,6 +496,7 @@ mod tests {
         assert!(rendered.contains("sudo touch /var/lib/vibebox/init.done"));
         assert!(rendered.contains("apt-get install -y avahi-daemon"));
         assert!(rendered.contains("systemctl, enable, --now, avahi-daemon"));
+        assert!(rendered.contains("[ share0, \"/mnt/share\", virtiofs"));
     }
 
     #[test]
@@ -454,6 +535,7 @@ mod tests {
                 host: 28000,
                 guest: 22,
             }],
+            shares: Vec::new(),
             created_unix: 0,
         };
 

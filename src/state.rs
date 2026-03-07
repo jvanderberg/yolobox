@@ -55,6 +55,12 @@ pub struct InstancePaths {
     pub metadata_path: PathBuf,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ShareMount {
+    pub host_path: PathBuf,
+    pub guest_path: PathBuf,
+}
+
 #[derive(Clone, Debug)]
 pub struct Instance {
     pub id: String,
@@ -69,6 +75,7 @@ pub struct Instance {
     pub rootfs_mb: u64,
     pub host_port_base: u16,
     pub ports: Vec<PortMapping>,
+    pub shares: Vec<ShareMount>,
     pub created_unix: u64,
 }
 
@@ -94,6 +101,7 @@ impl Instance {
                 self.rootfs_path.display(),
                 self.rootfs_mb
             ),
+            format!("shares: {}", summarize_shares(&self.shares)),
             format!("ports: {ports}"),
         ]
     }
@@ -172,6 +180,7 @@ pub fn ensure_instance(
     repo: &str,
     branch: &str,
     requested_base: Option<&str>,
+    requested_shares: Option<&[ShareMount]>,
 ) -> Result<Instance, String> {
     let paths = paths_for(repo, branch)?;
     fs::create_dir_all(&paths.checkout_dir).map_err(io_err)?;
@@ -200,6 +209,9 @@ pub fn ensure_instance(
     let target_rootfs_mib = desired_rootfs_mib(bytes_to_mib(base.size_bytes));
     ensure_branch_rootfs(&base.image_path, &paths.rootfs_path, target_rootfs_mib)?;
     let rootfs_mb = bytes_to_mib(fs::metadata(&paths.rootfs_path).map_err(io_err)?.len());
+    let shares = requested_shares
+        .map(|items| normalize_shares(items.to_vec()))
+        .unwrap_or_else(|| existing.as_ref().map(|instance| instance.shares.clone()).unwrap_or_default());
 
     let instance = Instance {
         id: current_id,
@@ -214,6 +226,7 @@ pub fn ensure_instance(
         rootfs_mb,
         host_port_base,
         ports: build_port_mappings(host_port_base, &DEFAULT_GUEST_PORTS),
+        shares,
         created_unix: existing
             .map(|instance| instance.created_unix)
             .unwrap_or_else(now_unix),
@@ -256,6 +269,41 @@ pub fn destroy_instance(repo: &str, branch: &str) -> Result<Option<PathBuf>, Str
 
     fs::remove_dir_all(&paths.instance_dir).map_err(io_err)?;
     Ok(Some(paths.instance_dir))
+}
+
+pub fn parse_share(spec: &str) -> Result<ShareMount, String> {
+    let (host, guest) = spec
+        .rsplit_once(':')
+        .ok_or_else(|| format!("invalid share {spec}; expected <host_path>:<guest_path>"))?;
+    if host.trim().is_empty() || guest.trim().is_empty() {
+        return Err(format!(
+            "invalid share {spec}; expected <host_path>:<guest_path>"
+        ));
+    }
+
+    let host_path = normalize_host_share_path(host)?;
+    if !host_path.is_dir() {
+        return Err(format!(
+            "shared host path {} is not a directory",
+            host_path.display()
+        ));
+    }
+
+    let guest_path = PathBuf::from(guest);
+    if !guest_path.is_absolute() {
+        return Err(format!(
+            "shared guest path {} must be absolute",
+            guest_path.display()
+        ));
+    }
+    if guest_path == Path::new("/workspace") {
+        return Err("/workspace is reserved for the checkout share".to_string());
+    }
+
+    Ok(ShareMount {
+        host_path,
+        guest_path,
+    })
 }
 
 fn resolve_base_image(
@@ -340,10 +388,20 @@ fn clone_or_copy_file(source: &Path, destination: &Path) -> Result<(), String> {
         if cloned == 0 {
             return Ok(());
         }
+
+        let err = std::io::Error::last_os_error();
+        Err(format!(
+            "clonefile failed for {} -> {}: {err}; vibebox requires APFS clonefile on macOS and will not fall back to a full copy",
+            source.display(),
+            destination.display()
+        ))
     }
 
-    fs::copy(source, destination).map_err(io_err)?;
-    Ok(())
+    #[cfg(not(target_os = "macos"))]
+    {
+        fs::copy(source, destination).map_err(io_err)?;
+        Ok(())
+    }
 }
 
 fn set_readonly(path: &Path, readonly: bool) -> Result<(), String> {
@@ -442,6 +500,34 @@ fn slugify(value: &str) -> String {
     slug.trim_matches('-').chars().take(48).collect()
 }
 
+fn normalize_host_share_path(value: &str) -> Result<PathBuf, String> {
+    let expanded = expand_tilde(value);
+    fs::canonicalize(&expanded).map_err(|err| {
+        format!(
+            "failed to resolve shared host path {}: {err}",
+            expanded.display()
+        )
+    })
+}
+
+fn expand_tilde(value: &str) -> PathBuf {
+    if value == "~" {
+        return env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(value));
+    }
+    if let Some(rest) = value.strip_prefix("~/") {
+        if let Some(home) = env::var_os("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    PathBuf::from(value)
+}
+
+fn normalize_shares(mut shares: Vec<ShareMount>) -> Vec<ShareMount> {
+    shares.sort();
+    shares.dedup();
+    shares
+}
+
 fn load_instance(path: &Path) -> Result<Option<Instance>, String> {
     if !path.exists() {
         return Ok(None);
@@ -464,6 +550,10 @@ fn load_instance(path: &Path) -> Result<Option<Instance>, String> {
         rootfs_mb: required_u64(&values, "rootfs_mb", path)?,
         host_port_base: required_u16(&values, "host_port_base", path)?,
         ports: parse_ports(&required_string(&values, "ports", path)?)?,
+        shares: optional_string(&values, "shares")
+            .map(|value| parse_shares(&value))
+            .transpose()?
+            .unwrap_or_default(),
         created_unix: required_u64(&values, "created_unix", path)?,
     }))
 }
@@ -491,6 +581,7 @@ fn save_instance(path: &Path, instance: &Instance) -> Result<(), String> {
     writeln!(file, "rootfs_mb={}", instance.rootfs_mb).map_err(io_err)?;
     writeln!(file, "host_port_base={}", instance.host_port_base).map_err(io_err)?;
     writeln!(file, "ports={}", encode_ports(&instance.ports)).map_err(io_err)?;
+    writeln!(file, "shares={}", encode_shares(&instance.shares)).map_err(io_err)?;
     writeln!(file, "created_unix={}", instance.created_unix).map_err(io_err)?;
     Ok(())
 }
@@ -549,6 +640,13 @@ fn required_string(values: &[(String, String)], key: &str, path: &Path) -> Resul
         .ok_or_else(|| format!("{} is missing {}", path.display(), key))
 }
 
+fn optional_string(values: &[(String, String)], key: &str) -> Option<String> {
+    values
+        .iter()
+        .find(|(candidate, _)| candidate == key)
+        .map(|(_, value)| value.clone())
+}
+
 fn required_u64(values: &[(String, String)], key: &str, path: &Path) -> Result<u64, String> {
     required_string(values, key, path)?
         .parse::<u64>()
@@ -589,6 +687,82 @@ fn parse_ports(value: &str) -> Result<Vec<PortMapping>, String> {
         .collect()
 }
 
+fn summarize_shares(shares: &[ShareMount]) -> String {
+    if shares.is_empty() {
+        return "none".to_string();
+    }
+
+    shares
+        .iter()
+        .map(|share| format!("{}->{}", share.host_path.display(), share.guest_path.display()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn encode_shares(shares: &[ShareMount]) -> String {
+    shares
+        .iter()
+        .map(|share| {
+            format!(
+                "{}:{}",
+                percent_encode(&share.host_path.to_string_lossy()),
+                percent_encode(&share.guest_path.to_string_lossy())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn parse_shares(value: &str) -> Result<Vec<ShareMount>, String> {
+    let mut shares = Vec::new();
+    for item in value.split(',').filter(|item| !item.is_empty()) {
+        let (host, guest) = item
+            .split_once(':')
+            .ok_or_else(|| format!("invalid share mapping: {item}"))?;
+        shares.push(ShareMount {
+            host_path: PathBuf::from(percent_decode(host)?),
+            guest_path: PathBuf::from(percent_decode(guest)?),
+        });
+    }
+    Ok(normalize_shares(shares))
+}
+
+fn percent_encode(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push('%');
+            encoded.push_str(&format!("{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+fn percent_decode(value: &str) -> Result<String, String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len() {
+                return Err(format!("invalid percent-encoding in {value}"));
+            }
+            let hex = std::str::from_utf8(&bytes[index + 1..index + 3])
+                .map_err(|_| format!("invalid percent-encoding in {value}"))?;
+            let byte = u8::from_str_radix(hex, 16)
+                .map_err(|_| format!("invalid percent-encoding in {value}"))?;
+            decoded.push(byte);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).map_err(|_| format!("invalid utf-8 in share path {value}"))
+}
+
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -609,8 +783,9 @@ struct BasePaths {
 
 #[cfg(test)]
 mod tests {
-    use super::desired_rootfs_mib;
+    use super::{desired_rootfs_mib, encode_shares, parse_shares, ShareMount};
     use std::env;
+    use std::path::PathBuf;
 
     #[test]
     fn desired_rootfs_defaults_to_large_sparse_disk() {
@@ -640,5 +815,22 @@ mod tests {
         unsafe {
             env::remove_var("VIBEBOX_ROOTFS_MIB");
         }
+    }
+
+    #[test]
+    fn shares_round_trip_through_metadata_encoding() {
+        let shares = vec![
+            ShareMount {
+                host_path: PathBuf::from("/Users/joshv/Library/Application Support/Vibes"),
+                guest_path: PathBuf::from("/mnt/vibes"),
+            },
+            ShareMount {
+                host_path: PathBuf::from("/tmp/a,b:c"),
+                guest_path: PathBuf::from("/mnt/weird:path"),
+            },
+        ];
+
+        let encoded = encode_shares(&shares);
+        assert_eq!(parse_shares(&encoded).unwrap(), shares);
     }
 }

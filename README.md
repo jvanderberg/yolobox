@@ -17,12 +17,97 @@ By default, branch disks are expanded to a sparse 32 GiB rootfs even if the impo
 
 While developing inside this repo, invoke it with `cargo run -- ...`. After building, the binary is `./target/debug/vibebox`.
 
+## Prerequisites
+
+The built-in VM path is currently aimed at macOS with APFS.
+
+Host requirements:
+
+- macOS on an APFS volume
+- Rust toolchain to build `vibebox`
+- `krunkit`
+- `vmnet-helper` / `vmnet-client`
+- an SSH keypair in a common `~/.ssh` location such as `id_ed25519` or `id_rsa`
+- a Linux base image that supports EFI, `virtio-blk`, `virtio-fs`, `cloud-init`, and `sshd`
+
+Install the local prerequisites:
+
+```bash
+brew tap slp/krunkit
+brew install krunkit
+curl -fsSL https://raw.githubusercontent.com/nirs/vmnet-helper/main/install.sh | sudo bash
+```
+
+Create an SSH key if you do not already have one:
+
+```bash
+ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519
+```
+
+Check whether the machine is ready:
+
+```bash
+cargo run -- doctor
+```
+
+Typical first-run flow:
+
+```bash
+cargo run -- base import --name ubuntu --image ./ubuntu-jammy-arm64.raw
+cargo run -- launch \
+  --repo git@github.com:org/repo.git \
+  --branch main \
+  --base ubuntu \
+  --init-script ./scripts/bootstrap-vm.sh
+```
+
+## Getting a Base Image
+
+You need a Linux guest image that supports:
+
+- EFI boot
+- `cloud-init`
+- `sshd`
+- `virtio-blk`
+- `virtio-fs`
+
+Ubuntu cloud images are a good starting point. A practical workflow is:
+
+1. Download an Ubuntu cloud image.
+2. Convert it to a raw disk image if needed.
+3. Import that raw image into `vibebox`.
+
+Example using an Ubuntu Jammy ARM64 cloud image:
+
+```bash
+curl -LO https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-arm64.img
+qemu-img convert -f qcow2 -O raw jammy-server-cloudimg-arm64.img ubuntu-jammy-arm64.raw
+cargo run -- base import --name ubuntu --image ./ubuntu-jammy-arm64.raw
+```
+
+If your download is already a raw image, you can skip the `qemu-img convert` step.
+
+You may need `qemu-img` locally for image conversion:
+
+```bash
+brew install qemu
+```
+
 ## Base Images
 
 Import a Linux image as a managed immutable base:
 
 ```bash
 cargo run -- base import --name ubuntu-24.04 --image /path/to/ubuntu.img
+```
+
+Capture a configured instance root disk as a new immutable base:
+
+```bash
+cargo run -- base capture \
+  --name ubuntu-dev \
+  --repo git@github.com:org/repo.git \
+  --branch main
 ```
 
 List imported bases:
@@ -37,7 +122,7 @@ Imported bases live under:
 $VIBEBOX_HOME/base-images/<base-id>/
 ```
 
-Each base is stored as `base.img` and marked read-only. On macOS, `vibebox` first tries to use APFS `clonefile(2)` semantics when creating copies, then falls back to a normal file copy if a clone is not possible.
+Each base is stored as `base.img` and marked read-only. On macOS, `vibebox` requires APFS `clonefile(2)` semantics when creating base and instance images and will fail instead of falling back to a full copy. That keeps captures and instance creation copy-on-write, but it means the source and destination need to be on the same APFS volume.
 
 ## Branch Model
 
@@ -128,6 +213,23 @@ cargo run -- launch \
 
 The init script is copied into cloud-init seed data, runs once per instance as the guest user, and can use `sudo` for system package installs. Output is written inside the guest to `/var/log/vibebox-init.log`.
 
+Share extra host directories into the guest:
+
+```bash
+cargo run -- launch \
+  --repo git@github.com:org/repo.git \
+  --branch main \
+  --base ubuntu-24.04 \
+  --share ~/Downloads:/mnt/downloads \
+  --share ~/src/shared-assets:/mnt/assets
+```
+
+The checkout is always shared at `/workspace`. Extra `--share` entries are persisted with the instance, so a plain later `launch` reuses them. If you change the share set for a running VM, `vibebox` will restart that VM on relaunch to apply the new mounts. Remove all saved extra shares with:
+
+```bash
+cargo run -- launch --repo git@github.com:org/repo.git --branch main --clear-shares
+```
+
 Inspect or remove a branch instance:
 
 ```bash
@@ -171,6 +273,7 @@ Cloud-init is enabled by default for VM launches. `vibebox` will:
 - set the guest hostname from the instance id unless you override it
 - write a `network-config` file that assigns a deterministic static guest IP
 - auto-mount the `virtio-fs` share at `/workspace`
+- auto-mount any extra `--share` `virtio-fs` directories you configured
 - create `~/workspace` as a symlink to `/workspace`
 - install and start `avahi-daemon` so the guest hostname is advertised over mDNS as `<hostname>.local`
 - write `cloud-init/files/user-data` and `cloud-init/files/meta-data`
