@@ -131,6 +131,12 @@ struct LaunchOptions {
     with_gh: bool,
     #[arg(long = "with-ai")]
     with_ai: bool,
+    #[arg(long = "no-codex", conflicts_with = "with_codex")]
+    no_codex: bool,
+    #[arg(long = "no-claude", conflicts_with = "with_claude")]
+    no_claude: bool,
+    #[arg(long = "no-gh", conflicts_with = "with_gh")]
+    no_gh: bool,
     #[arg(long)]
     verbose: bool,
     #[arg(long = "clear-shares")]
@@ -288,16 +294,8 @@ fn launch(options: LaunchOptions) -> Result<(), String> {
     if options.vm && options.shell_only {
         return Err("--vm and --shell are mutually exclusive".to_string());
     }
-    if options.clear_shares
-        && (!options.shares.is_empty()
-            || options.with_codex
-            || options.with_claude
-            || options.with_gh)
-    {
-        return Err(
-            "--clear-shares cannot be combined with --share, --with-codex, --with-claude, --with-gh, or --with-ai"
-                .to_string(),
-        );
+    if options.clear_shares && !options.shares.is_empty() {
+        return Err("--clear-shares cannot be combined with --share".to_string());
     }
     if !options.cloud_init && options.init_script.is_some() {
         return Err("--init-script requires cloud-init; remove --no-cloud-init".to_string());
@@ -317,11 +315,13 @@ fn launch(options: LaunchOptions) -> Result<(), String> {
         None
     };
     let instance_name = options.name.as_deref().or(generated_name.as_deref());
-    let requested_shares = if options.clear_shares {
-        Some(Vec::new())
-    } else {
-        build_requested_shares(&options)?
-    };
+    let existing_instance = state::find_instance(
+        instance_name,
+        options.repo.as_deref(),
+        options.branch.as_deref(),
+        resolved_base.as_deref(),
+    )?;
+    let requested_shares = build_requested_shares(existing_instance.as_ref(), &options)?;
     let requested_guest_env = build_requested_guest_env(&options)?;
     let instance = state::ensure_instance(
         instance_name,
@@ -750,6 +750,7 @@ fn normalize_launch_options(mut options: LaunchOptions) -> LaunchOptions {
     if options.with_ai {
         options.with_codex = true;
         options.with_claude = true;
+        options.with_gh = true;
     }
     options
 }
@@ -763,26 +764,61 @@ fn render_help() -> String {
     String::from_utf8(output).expect("clap help should be valid UTF-8")
 }
 
-fn build_requested_shares(options: &LaunchOptions) -> Result<Option<Vec<ShareMount>>, String> {
-    let mut shares = options.shares.clone();
-    if options.with_codex {
-        shares.push(default_credential_share(".codex", &options.cloud_user)?);
-    }
-    if options.with_claude {
-        shares.push(default_credential_share(".claude", &options.cloud_user)?);
-    }
-    if options.with_gh {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SharePreference {
+    Disabled,
+    Optional,
+    Required,
+}
+
+fn build_requested_shares(
+    existing_instance: Option<&state::Instance>,
+    options: &LaunchOptions,
+) -> Result<Option<Vec<ShareMount>>, String> {
+    let mut shares = if options.clear_shares || !options.shares.is_empty() {
+        options.shares.clone()
+    } else {
+        existing_instance
+            .map(|instance| {
+                instance
+                    .shares
+                    .iter()
+                    .filter(|share| !is_ai_managed_share(share, &options.cloud_user))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+
+    add_optional_or_required_share(
+        &mut shares,
+        ".codex",
+        &options.cloud_user,
+        codex_share_preference(options),
+    )?;
+    add_optional_or_required_share(
+        &mut shares,
+        ".claude",
+        &options.cloud_user,
+        claude_share_preference(options),
+    )?;
+    if gh_enabled(options) {
         if let Ok(share) = default_credential_share(".config/gh", &options.cloud_user) {
             shares.push(share);
         }
     }
 
-    if shares.is_empty() {
+    shares.sort();
+    shares.dedup();
+
+    if let Some(instance) = existing_instance {
+        if shares == instance.shares {
+            return Ok(None);
+        }
+    } else if shares.is_empty() {
         return Ok(None);
     }
 
-    shares.sort();
-    shares.dedup();
     Ok(Some(shares))
 }
 
@@ -810,7 +846,7 @@ fn build_requested_guest_env(options: &LaunchOptions) -> Result<Option<Vec<Guest
         });
     }
 
-    if options.with_claude {
+    if claude_enabled(options) {
         if let Some(value) = env::var_os("ANTHROPIC_API_KEY") {
             vars.push(GuestEnvVar {
                 name: "ANTHROPIC_API_KEY".to_string(),
@@ -821,7 +857,7 @@ fn build_requested_guest_env(options: &LaunchOptions) -> Result<Option<Vec<Guest
         }
     }
 
-    if options.with_gh {
+    if gh_enabled(options) {
         if let Some(token) = host_gh_auth_token()? {
             vars.push(GuestEnvVar {
                 name: "GH_TOKEN".to_string(),
@@ -897,6 +933,63 @@ fn default_credential_share(dotdir: &str, cloud_user: &str) -> Result<ShareMount
     })
 }
 
+fn add_optional_or_required_share(
+    shares: &mut Vec<ShareMount>,
+    dotdir: &str,
+    cloud_user: &str,
+    preference: SharePreference,
+) -> Result<(), String> {
+    match preference {
+        SharePreference::Disabled => Ok(()),
+        SharePreference::Optional => {
+            if let Ok(share) = default_credential_share(dotdir, cloud_user) {
+                shares.push(share);
+            }
+            Ok(())
+        }
+        SharePreference::Required => {
+            shares.push(default_credential_share(dotdir, cloud_user)?);
+            Ok(())
+        }
+    }
+}
+
+fn codex_share_preference(options: &LaunchOptions) -> SharePreference {
+    share_preference(options.with_codex, options.no_codex)
+}
+
+fn claude_share_preference(options: &LaunchOptions) -> SharePreference {
+    share_preference(options.with_claude, options.no_claude)
+}
+
+fn share_preference(explicit_enable: bool, explicit_disable: bool) -> SharePreference {
+    if explicit_disable {
+        SharePreference::Disabled
+    } else if explicit_enable {
+        SharePreference::Required
+    } else {
+        SharePreference::Optional
+    }
+}
+
+fn claude_enabled(options: &LaunchOptions) -> bool {
+    claude_share_preference(options) != SharePreference::Disabled
+}
+
+fn gh_enabled(options: &LaunchOptions) -> bool {
+    !options.no_gh
+}
+
+fn is_ai_managed_share(share: &ShareMount, cloud_user: &str) -> bool {
+    [
+        format!("/home/{cloud_user}/.codex"),
+        format!("/home/{cloud_user}/.claude"),
+        format!("/home/{cloud_user}/.config/gh"),
+    ]
+    .iter()
+    .any(|path| share.guest_path == PathBuf::from(path))
+}
+
 fn default_base_name() -> Result<Option<String>, String> {
     let images = state::list_base_images()?;
     Ok(images
@@ -925,7 +1018,8 @@ fn generate_instance_name() -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BaseCommand, Cli, Command, confirm_destroy_answer, missing_base_guidance,
+        BaseCommand, Cli, Command, SharePreference, claude_share_preference,
+        codex_share_preference, confirm_destroy_answer, gh_enabled, missing_base_guidance,
         missing_ssh_guidance, missing_vm_runtime_guidance,
     };
 
@@ -951,6 +1045,42 @@ mod tests {
                 assert_eq!(options.base.as_deref(), Some("ubuntu"));
                 assert!(options.with_gh);
                 assert_eq!(options.shares.len(), 1);
+            }
+            _ => panic!("expected launch command"),
+        }
+    }
+
+    #[test]
+    fn ai_integrations_are_enabled_by_default() {
+        let cli = Cli::parse(vec!["--base".to_string(), "ubuntu".to_string()])
+            .expect("parse should succeed");
+
+        match cli.command {
+            Command::Launch(options) => {
+                assert_eq!(codex_share_preference(&options), SharePreference::Optional);
+                assert_eq!(claude_share_preference(&options), SharePreference::Optional);
+                assert!(gh_enabled(&options));
+            }
+            _ => panic!("expected launch command"),
+        }
+    }
+
+    #[test]
+    fn ai_integrations_can_be_opted_out_individually() {
+        let cli = Cli::parse(vec![
+            "--base".to_string(),
+            "ubuntu".to_string(),
+            "--no-codex".to_string(),
+            "--no-claude".to_string(),
+            "--no-gh".to_string(),
+        ])
+        .expect("parse should succeed");
+
+        match cli.command {
+            Command::Launch(options) => {
+                assert_eq!(codex_share_preference(&options), SharePreference::Disabled);
+                assert_eq!(claude_share_preference(&options), SharePreference::Disabled);
+                assert!(!gh_enabled(&options));
             }
             _ => panic!("expected launch command"),
         }

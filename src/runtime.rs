@@ -530,7 +530,7 @@ fn detect_runtime_failure(krunkit_log: &Path) -> Result<Option<String>, String> 
 }
 
 fn connect_ssh(
-    _instance: &Instance,
+    instance: &Instance,
     ssh_user: &str,
     ssh_private_key: &Path,
     known_hosts: &Path,
@@ -543,7 +543,12 @@ fn connect_ssh(
     command
         .arg("-tt")
         .arg(format!("{ssh_user}@{}", vmnet.guest_ip))
-        .arg(guest_shell_command(shares, guest_env, verbose));
+        .arg(guest_shell_command(
+            &instance.id,
+            shares,
+            guest_env,
+            verbose,
+        ));
 
     let status = command.status().map_err(|err| err.to_string())?;
     Ok(status.code().unwrap_or_default())
@@ -593,7 +598,12 @@ fn set_current_process_nofile_limit(limit: libc::rlim_t) -> Result<(), IoError> 
     Ok(())
 }
 
-fn guest_shell_command(shares: &[ShareMount], guest_env: &[GuestEnvVar], verbose: bool) -> String {
+fn guest_shell_command(
+    instance_id: &str,
+    shares: &[ShareMount],
+    guest_env: &[GuestEnvVar],
+    verbose: bool,
+) -> String {
     let mut share_mounts = String::new();
     for (index, share) in shares.iter().enumerate() {
         let path = shell_quote(&share.guest_path.display().to_string());
@@ -606,6 +616,7 @@ fn guest_shell_command(shares: &[ShareMount], guest_env: &[GuestEnvVar], verbose
         .iter()
         .map(|var| format!(" export {}={};", var.name, shell_quote(&var.value)))
         .collect::<String>();
+    let title_setup = format!(" printf '\\033]0;%s\\007' {};", shell_quote(instance_id));
     let git_identity_sync = " if command -v git >/dev/null 2>&1; then if [ -n \"${GIT_AUTHOR_NAME:-}\" ]; then git config --global user.name \"$GIT_AUTHOR_NAME\" >/dev/null 2>&1 || true; fi; if [ -n \"${GIT_AUTHOR_EMAIL:-}\" ]; then git config --global user.email \"$GIT_AUTHOR_EMAIL\" >/dev/null 2>&1 || true; fi; fi;";
 
     let cloud_init_wait = if verbose {
@@ -615,8 +626,9 @@ fn guest_shell_command(shares: &[ShareMount], guest_env: &[GuestEnvVar], verbose
     };
 
     let body = format!(
-        "{cloud_init_wait} ROOT_DEV=\"$(findmnt -n -o SOURCE / 2>/dev/null || true)\"; ROOT_FS=\"$(findmnt -n -o FSTYPE / 2>/dev/null || true)\"; if command -v growpart >/dev/null 2>&1 && [ -n \"$ROOT_DEV\" ]; then PARENT_DEV=\"/dev/$(lsblk -no PKNAME \"$ROOT_DEV\" 2>/dev/null || true)\"; PART_NUM=\"$(lsblk -no PARTN \"$ROOT_DEV\" 2>/dev/null || true)\"; if [ -n \"$PARENT_DEV\" ] && [ -n \"$PART_NUM\" ]; then sudo growpart \"$PARENT_DEV\" \"$PART_NUM\" >/dev/null 2>&1 || true; fi; fi; if [ -n \"$ROOT_DEV\" ]; then case \"$ROOT_FS\" in ext2|ext3|ext4) if command -v resize2fs >/dev/null 2>&1; then sudo resize2fs \"$ROOT_DEV\" >/dev/null 2>&1 || true; fi ;; xfs) if command -v xfs_growfs >/dev/null 2>&1; then sudo xfs_growfs / >/dev/null 2>&1 || true; fi ;; esac; fi; ulimit -n {nofile_limit} >/dev/null 2>&1 || true; if [ -e /workspace ] && [ ! -d /workspace ]; then sudo rm -f /workspace; fi; sudo mkdir -p /workspace; if ! mountpoint -q /workspace; then sudo mount -t virtiofs workspace /workspace >/dev/null 2>&1 || true; fi;{share_mounts}{guest_env_exports}{git_identity_sync} ln -sfn {workspace_path} \"$HOME/workspace\"; cd {workspace_path} 2>/dev/null || cd \"$HOME\"; exec /bin/bash -l",
+        "{cloud_init_wait} ROOT_DEV=\"$(findmnt -n -o SOURCE / 2>/dev/null || true)\"; ROOT_FS=\"$(findmnt -n -o FSTYPE / 2>/dev/null || true)\"; if command -v growpart >/dev/null 2>&1 && [ -n \"$ROOT_DEV\" ]; then PARENT_DEV=\"/dev/$(lsblk -no PKNAME \"$ROOT_DEV\" 2>/dev/null || true)\"; PART_NUM=\"$(lsblk -no PARTN \"$ROOT_DEV\" 2>/dev/null || true)\"; if [ -n \"$PARENT_DEV\" ] && [ -n \"$PART_NUM\" ]; then sudo growpart \"$PARENT_DEV\" \"$PART_NUM\" >/dev/null 2>&1 || true; fi; fi; if [ -n \"$ROOT_DEV\" ]; then case \"$ROOT_FS\" in ext2|ext3|ext4) if command -v resize2fs >/dev/null 2>&1; then sudo resize2fs \"$ROOT_DEV\" >/dev/null 2>&1 || true; fi ;; xfs) if command -v xfs_growfs >/dev/null 2>&1; then sudo xfs_growfs / >/dev/null 2>&1 || true; fi ;; esac; fi; ulimit -n {nofile_limit} >/dev/null 2>&1 || true; if [ -e /workspace ] && [ ! -d /workspace ]; then sudo rm -f /workspace; fi; sudo mkdir -p /workspace; if ! mountpoint -q /workspace; then sudo mount -t virtiofs workspace /workspace >/dev/null 2>&1 || true; fi;{share_mounts}{guest_env_exports}{title_setup}{git_identity_sync} ln -sfn {workspace_path} \"$HOME/workspace\"; cd {workspace_path} 2>/dev/null || cd \"$HOME\"; exec /bin/bash -l",
         nofile_limit = GUEST_NOFILE_LIMIT,
+        title_setup = title_setup,
         workspace_path = GUEST_WORKSPACE_PATH,
     );
 
@@ -1090,6 +1102,7 @@ mod tests {
     #[test]
     fn guest_shell_waits_for_workspace_readiness() {
         let command = guest_shell_command(
+            "markless-main",
             &[ShareMount {
                 host_path: PathBuf::from("/tmp/share"),
                 guest_path: PathBuf::from("/mnt/share"),
@@ -1119,7 +1132,7 @@ mod tests {
 
     #[test]
     fn quiet_guest_shell_suppresses_bootstrap_chatter() {
-        let command = guest_shell_command(&[], &[], false);
+        let command = guest_shell_command("markless-main", &[], &[], false);
         assert!(command.contains("cloud-init status --wait >/dev/null 2>&1"));
         assert!(!command.contains("waiting for cloud-init/bootstrap"));
         assert!(!command.contains("bootstrap log:"));

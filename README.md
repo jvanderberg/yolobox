@@ -4,7 +4,7 @@ Branch-scoped Linux VMs for local development on macOS. Each repo branch gets it
 
 ```bash
 yolobox base import --name ubuntu --image ./ubuntu-jammy-arm64.raw
-yolobox --repo git@github.com:org/repo.git --branch main --with-ai
+yolobox --repo git@github.com:org/repo.git --branch main
 ```
 
 You're dropped into a Linux shell with your repo at `/workspace`, your SSH agent forwarded, and guest services reachable from the host at `<project>-<branch>.local` (e.g. `repo-main.local`).
@@ -107,16 +107,19 @@ Shares are persisted with the instance -- later launches reuse them automaticall
 
 ### AI and Dev Tool Integration
 
-Forward host credentials into the guest:
+AI integrations are enabled by default. On launch, yolobox will try to share the host config directories for Codex, Claude, and GitHub into the guest when they exist.
 
 | Flag | What it shares |
 |------|---------------|
-| `--with-ai` | All three below |
-| `--with-claude` | `~/.claude` directory + `ANTHROPIC_API_KEY` env var |
-| `--with-codex` | `~/.codex` directory |
-| `--with-gh` | `~/.config/gh` directory + `GH_TOKEN` from `gh auth token` |
+| `--with-ai` | Compatibility flag for the default behavior |
+| `--with-claude` | Require `~/.claude` to be shared and export `ANTHROPIC_API_KEY` |
+| `--with-codex` | Require `~/.codex` to be shared |
+| `--with-gh` | Share `~/.config/gh` when present and export `GH_TOKEN` from `gh auth token` |
+| `--no-claude` | Disable Claude integration for this launch |
+| `--no-codex` | Disable Codex integration for this launch |
+| `--no-gh` | Disable GitHub CLI integration for this launch |
 
-These are `virtio-fs` mounts, so they persist like any other share.
+These are `virtio-fs` mounts, so they persist like any other share. yolobox also installs a profile script in the guest that makes `claude` run with `--dangerously-skip-permissions` and `codex` run with `--dangerously-bypass-approvals-and-sandbox` by default. Use `command claude ...` or `command codex ...` if you want the raw CLI behavior in a shell.
 
 ### Init Scripts
 

@@ -414,8 +414,9 @@ fn render_runcmd(user: &str, shares: &[ShareMount], includes_init_script: bool) 
 
 fn render_common_write_files(user: &str) -> String {
     format!(
-        "  - path: /etc/security/limits.d/99-yolobox.conf\n    permissions: '0644'\n    owner: root:root\n    content: |\n{}\n",
-        indent_for_yaml(&render_nofile_limits(user), 6)
+        "  - path: /etc/security/limits.d/99-yolobox.conf\n    permissions: '0644'\n    owner: root:root\n    content: |\n{}\n  - path: /etc/profile.d/yolobox-ai.sh\n    permissions: '0644'\n    owner: root:root\n    content: |\n{}\n",
+        indent_for_yaml(&render_nofile_limits(user), 6),
+        indent_for_yaml(&render_ai_shell_defaults(), 6)
     )
 }
 
@@ -424,6 +425,22 @@ fn render_nofile_limits(user: &str) -> String {
         "* soft nofile {limit}\n* hard nofile {limit}\nroot soft nofile {limit}\nroot hard nofile {limit}\n{user} soft nofile {limit}\n{user} hard nofile {limit}\n",
         limit = DEFAULT_NOFILE_LIMIT
     )
+}
+
+fn render_ai_shell_defaults() -> String {
+    r#"if command -v claude >/dev/null 2>&1; then
+  claude() {
+    command claude --dangerously-skip-permissions "$@"
+  }
+fi
+
+if command -v codex >/dev/null 2>&1; then
+  codex() {
+    command codex --dangerously-bypass-approvals-and-sandbox "$@"
+  }
+fi
+"#
+    .to_string()
 }
 
 fn share_tag(index: usize) -> String {
@@ -516,7 +533,10 @@ mod tests {
         assert!(rendered.contains("apt-get install -y avahi-daemon"));
         assert!(rendered.contains("systemctl, enable, --now, avahi-daemon"));
         assert!(rendered.contains("path: /etc/security/limits.d/99-yolobox.conf"));
+        assert!(rendered.contains("path: /etc/profile.d/yolobox-ai.sh"));
         assert!(rendered.contains("* soft nofile 65536"));
+        assert!(rendered.contains("command claude --dangerously-skip-permissions"));
+        assert!(rendered.contains("command codex --dangerously-bypass-approvals-and-sandbox"));
         assert!(rendered.contains("workspace, /workspace, virtiofs"));
         assert!(rendered.contains("ln, -sfn, /workspace, /home/vibe/workspace"));
     }
@@ -550,6 +570,7 @@ mod tests {
         assert!(rendered.contains("apt-get install -y avahi-daemon"));
         assert!(rendered.contains("systemctl, enable, --now, avahi-daemon"));
         assert!(rendered.contains("path: /etc/security/limits.d/99-yolobox.conf"));
+        assert!(rendered.contains("path: /etc/profile.d/yolobox-ai.sh"));
         assert!(rendered.contains("[ share0, \"/mnt/share\", virtiofs"));
     }
 
