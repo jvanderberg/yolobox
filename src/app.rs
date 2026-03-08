@@ -1,7 +1,7 @@
 use crate::cloud_init::{self, CloudInitOptions};
 use crate::git;
 use crate::network;
-use crate::runtime::{self, LaunchConfig, LaunchMode};
+use crate::runtime::{self, GuestExecCommand, LaunchConfig, LaunchMode};
 use crate::state::{self, GuestEnvVar, ShareMount};
 use clap::error::ErrorKind;
 use clap::{ArgAction, ArgGroup, Args, CommandFactory, Parser, Subcommand};
@@ -17,6 +17,7 @@ pub fn run() -> Result<(), String> {
     match cli.command {
         Command::Base(command) => base(command),
         Command::Launch(options) => launch(options),
+        Command::Exec(options) => exec(options),
         Command::Status(options) => status(options),
         Command::Stop(options) => stop(options),
         Command::Doctor => doctor(),
@@ -35,6 +36,8 @@ enum Command {
     Base(BaseCommand),
     /// Create or reopen an instance and optionally enter it.
     Launch(LaunchOptions),
+    /// Run a non-interactive command inside an instance over SSH.
+    Exec(ExecOptions),
     /// Show instance metadata and whether the VM is currently running.
     Status(TargetOptions),
     /// Stop a running VM without deleting its state.
@@ -215,6 +218,30 @@ struct DestroyOptions {
     yes: bool,
 }
 
+#[derive(Clone, Debug, Args)]
+struct ExecOptions {
+    #[command(flatten)]
+    target: TargetOptions,
+    /// Guest username to use for the SSH connection.
+    #[arg(long = "user", default_value_t = cloud_init::default_cloud_user())]
+    user: String,
+    /// Path to the private SSH key used to connect to the guest.
+    #[arg(long = "ssh-private-key")]
+    ssh_private_key: Option<PathBuf>,
+    /// Guest working directory for the command. Defaults to /workspace.
+    #[arg(long = "cwd")]
+    cwd: Option<String>,
+    /// Extra environment variable to export before running the command, as NAME=VALUE.
+    #[arg(long = "env", value_parser = parse_exec_env_var)]
+    env: Vec<GuestEnvVar>,
+    /// Print VM launch details and guest bootstrap progress.
+    #[arg(long)]
+    verbose: bool,
+    /// Command and arguments to run inside the guest.
+    #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+    command: Vec<String>,
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "yolobox",
@@ -235,6 +262,8 @@ enum ClapCommand {
     Base(ClapBaseCommand),
     /// Create or reopen an instance and optionally enter it.
     Launch(LaunchOptions),
+    /// Run a non-interactive command inside an instance over SSH.
+    Exec(ExecOptions),
     /// Show instance metadata and whether the VM is currently running.
     Status(TargetOptions),
     /// Stop a running VM without deleting its state.
@@ -279,6 +308,7 @@ impl Cli {
             Some(ClapCommand::Launch(options)) => {
                 Command::Launch(normalize_launch_options(options))
             }
+            Some(ClapCommand::Exec(options)) => Command::Exec(options),
             Some(ClapCommand::Status(options)) => Command::Status(options),
             Some(ClapCommand::Stop(options)) => Command::Stop(options),
             Some(ClapCommand::Doctor) => Command::Doctor,
@@ -479,6 +509,55 @@ fn launch(options: LaunchOptions) -> Result<(), String> {
     Ok(())
 }
 
+fn exec(options: ExecOptions) -> Result<(), String> {
+    let plan = runtime::resolve_runtime(false);
+    if !matches!(plan.mode, LaunchMode::Krunkit) {
+        return Err(
+            "yolobox exec currently supports only the built-in krunkit runtime".to_string(),
+        );
+    }
+
+    let instance = state::find_instance(
+        options.target.name.as_deref(),
+        options.target.repo.as_deref(),
+        options.target.branch.as_deref(),
+        options.target.base.as_deref(),
+    )?
+    .ok_or_else(|| missing_instance_message(&options.target))?;
+    let ssh_private_key_path = options
+        .ssh_private_key
+        .clone()
+        .or_else(cloud_init::discover_ssh_private_key)
+        .ok_or_else(missing_ssh_guidance)?;
+    let vmnet = network::resolve_for_instance(&instance)?;
+    let launch_config = LaunchConfig {
+        require_vm: true,
+        cpus: runtime::default_cpus(),
+        memory_mib: runtime::default_memory_mib(),
+        cloud_init_image: None,
+        cloud_init_user: Some(options.user.clone()),
+        hostname: None,
+        ssh_pubkey_path: None,
+        ssh_private_key_path: Some(ssh_private_key_path),
+        init_script_path: None,
+        shares: instance.shares.clone(),
+        guest_env: instance.guest_env.clone(),
+        verbose: options.verbose,
+        vmnet: Some(vmnet),
+    };
+    let command = GuestExecCommand {
+        cwd: options.cwd.clone(),
+        env: normalize_exec_env(options.env),
+        command: options.command[0].clone(),
+        args: options.command[1..].to_vec(),
+    };
+    let code = runtime::exec(plan, &instance, &launch_config, &command)?;
+    if code != 0 {
+        return Err(format!("child process exited with code {code}"));
+    }
+    Ok(())
+}
+
 fn status(options: TargetOptions) -> Result<(), String> {
     let instance = state::find_instance(
         options.name.as_deref(),
@@ -639,6 +718,26 @@ fn resolve_launch_selector(mut options: LaunchOptions) -> Result<LaunchOptions, 
         options.branch = Some(branch);
     }
     Ok(options)
+}
+
+fn parse_exec_env_var(spec: &str) -> Result<GuestEnvVar, String> {
+    let (name, value) = spec
+        .split_once('=')
+        .ok_or_else(|| format!("invalid env var {spec}; expected NAME=VALUE"))?;
+    let trimmed_name = name.trim();
+    if trimmed_name.is_empty() {
+        return Err(format!("invalid env var {spec}; name cannot be empty"));
+    }
+    Ok(GuestEnvVar {
+        name: trimmed_name.to_string(),
+        value: value.to_string(),
+    })
+}
+
+fn normalize_exec_env(mut vars: Vec<GuestEnvVar>) -> Vec<GuestEnvVar> {
+    vars.sort_by(|left, right| left.name.cmp(&right.name));
+    vars.dedup_by(|left, right| left.name == right.name);
+    vars
 }
 
 fn prompt_for_branch(repo: &str) -> Result<String, String> {
@@ -1100,7 +1199,7 @@ mod tests {
     use super::{
         BaseCommand, Cli, Command, SharePreference, claude_share_preference,
         codex_share_preference, confirm_destroy_answer, gh_enabled, missing_base_guidance,
-        missing_ssh_guidance, missing_vm_runtime_guidance, render_help,
+        missing_ssh_guidance, missing_vm_runtime_guidance, parse_exec_env_var, render_help,
     };
 
     #[test]
@@ -1211,6 +1310,41 @@ mod tests {
             }
             _ => panic!("expected stop command"),
         }
+    }
+
+    #[test]
+    fn exec_subcommand_parses_command_and_env() {
+        let cli = Cli::parse(vec![
+            "exec".to_string(),
+            "--name".to_string(),
+            "repo-main".to_string(),
+            "--env".to_string(),
+            "CODEX_HOME=/workspace/.codex".to_string(),
+            "--cwd".to_string(),
+            "/workspace".to_string(),
+            "--".to_string(),
+            "codex".to_string(),
+            "app-server".to_string(),
+        ])
+        .expect("parse should succeed");
+
+        match cli.command {
+            Command::Exec(options) => {
+                assert_eq!(options.target.name.as_deref(), Some("repo-main"));
+                assert_eq!(options.cwd.as_deref(), Some("/workspace"));
+                assert_eq!(options.command, vec!["codex".to_string(), "app-server".to_string()]);
+                assert_eq!(options.env.len(), 1);
+                assert_eq!(options.env[0].name, "CODEX_HOME");
+                assert_eq!(options.env[0].value, "/workspace/.codex");
+            }
+            _ => panic!("expected exec command"),
+        }
+    }
+
+    #[test]
+    fn exec_env_var_requires_name_value_syntax() {
+        assert!(parse_exec_env_var("CODEX_HOME=/workspace/.codex").is_ok());
+        assert!(parse_exec_env_var("broken").is_err());
     }
 
     #[test]

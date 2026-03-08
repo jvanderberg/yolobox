@@ -60,6 +60,13 @@ pub struct LaunchConfig {
     pub vmnet: Option<VmnetConfig>,
 }
 
+pub struct GuestExecCommand {
+    pub cwd: Option<String>,
+    pub env: Vec<GuestEnvVar>,
+    pub command: String,
+    pub args: Vec<String>,
+}
+
 pub fn default_cpus() -> u8 {
     DEFAULT_CPUS
 }
@@ -126,6 +133,24 @@ pub fn launch(
         }
         LaunchMode::External(launcher) => launch_external(&launcher, instance, config),
         LaunchMode::Krunkit => launch_krunkit(instance, config),
+    }
+}
+
+pub fn exec(
+    plan: RuntimePlan,
+    instance: &Instance,
+    config: &LaunchConfig,
+    guest_command: &GuestExecCommand,
+) -> Result<i32, String> {
+    match plan.mode {
+        LaunchMode::Shell => Err(
+            "yolobox exec requires the built-in VM runtime; shell-only mode is not supported"
+                .to_string(),
+        ),
+        LaunchMode::External(_) => Err(
+            "yolobox exec currently supports only the built-in krunkit runtime".to_string(),
+        ),
+        LaunchMode::Krunkit => exec_krunkit(instance, config, guest_command),
     }
 }
 
@@ -272,17 +297,57 @@ fn launch_external(
 }
 
 fn launch_krunkit(instance: &Instance, config: &LaunchConfig) -> Result<i32, String> {
+    let (ssh_user, ssh_private_key, known_hosts, vmnet) =
+        ensure_krunkit_vm_ready(instance, config)?;
+
+    connect_ssh(
+        instance,
+        &ssh_user,
+        &ssh_private_key,
+        &known_hosts,
+        &vmnet,
+        &config.shares,
+        &config.guest_env,
+        config.verbose,
+    )
+}
+
+fn exec_krunkit(
+    instance: &Instance,
+    config: &LaunchConfig,
+    guest_command: &GuestExecCommand,
+) -> Result<i32, String> {
+    let (ssh_user, ssh_private_key, known_hosts, vmnet) =
+        ensure_krunkit_vm_ready(instance, config)?;
+
+    exec_ssh(
+        instance,
+        &ssh_user,
+        &ssh_private_key,
+        &known_hosts,
+        &vmnet,
+        &config.shares,
+        &config.guest_env,
+        config.verbose,
+        guest_command,
+    )
+}
+
+fn ensure_krunkit_vm_ready(
+    instance: &Instance,
+    config: &LaunchConfig,
+) -> Result<(String, PathBuf, PathBuf, VmnetConfig), String> {
     let vmnet = config
         .vmnet
-        .as_ref()
+        .clone()
         .ok_or_else(|| "built-in VM networking requires vmnet-client".to_string())?;
     let ssh_user = config
         .cloud_init_user
-        .as_deref()
+        .clone()
         .ok_or_else(|| "SSH guest user is required for built-in VM launch".to_string())?;
     let ssh_private_key = config
         .ssh_private_key_path
-        .as_ref()
+        .clone()
         .ok_or_else(|| "SSH private key is required for built-in VM launch".to_string())?;
 
     let runtime_dir = instance.instance_dir.join("runtime");
@@ -301,22 +366,13 @@ fn launch_krunkit(instance: &Instance, config: &LaunchConfig) -> Result<i32, Str
             }
             if wait_for_running_vm_ssh(
                 &instance.instance_dir,
-                ssh_user,
-                ssh_private_key,
+                &ssh_user,
+                &ssh_private_key,
                 &known_hosts,
-                vmnet,
+                &vmnet,
                 config.verbose,
             )? {
-                return connect_ssh(
-                    instance,
-                    ssh_user,
-                    ssh_private_key,
-                    &known_hosts,
-                    vmnet,
-                    &config.shares,
-                    &config.guest_env,
-                    config.verbose,
-                );
+                return Ok((ssh_user, ssh_private_key, known_hosts, vmnet));
             }
 
             if config.verbose {
@@ -409,10 +465,10 @@ fn launch_krunkit(instance: &Instance, config: &LaunchConfig) -> Result<i32, Str
     let mut child = command.spawn().map_err(|err| err.to_string())?;
     let ssh_ready = wait_for_ssh(
         &mut child,
-        ssh_user,
-        ssh_private_key,
+        &ssh_user,
+        &ssh_private_key,
         &known_hosts,
-        vmnet,
+        &vmnet,
         &krunkit_log,
         config.verbose,
     )?;
@@ -426,16 +482,7 @@ fn launch_krunkit(instance: &Instance, config: &LaunchConfig) -> Result<i32, Str
         ));
     }
 
-    connect_ssh(
-        instance,
-        ssh_user,
-        ssh_private_key,
-        &known_hosts,
-        vmnet,
-        &config.shares,
-        &config.guest_env,
-        config.verbose,
-    )
+    Ok((ssh_user, ssh_private_key, known_hosts, vmnet))
 }
 
 fn wait_for_ssh(
@@ -556,6 +603,33 @@ fn connect_ssh(
     Ok(status.code().unwrap_or_default())
 }
 
+fn exec_ssh(
+    instance: &Instance,
+    ssh_user: &str,
+    ssh_private_key: &Path,
+    known_hosts: &Path,
+    vmnet: &VmnetConfig,
+    shares: &[ShareMount],
+    guest_env: &[GuestEnvVar],
+    verbose: bool,
+    guest_command: &GuestExecCommand,
+) -> Result<i32, String> {
+    let mut command = ssh_base_command(ssh_user, ssh_private_key, known_hosts, vmnet, false);
+    command
+        .arg("-T")
+        .arg(format!("{ssh_user}@{}", vmnet.guest_ip))
+        .arg(guest_exec_command(
+            &instance.id,
+            shares,
+            guest_env,
+            verbose,
+            guest_command,
+        ));
+
+    let status = command.status().map_err(|err| err.to_string())?;
+    Ok(status.code().unwrap_or_default())
+}
+
 fn krunkit_network_device(mac_address: &str) -> String {
     format!("virtio-net,type=unixgram,fd=4,mac={mac_address}")
 }
@@ -607,6 +681,54 @@ fn guest_shell_command(
     verbose: bool,
     interactive: bool,
 ) -> String {
+    let body = format!(
+        "{} exec /bin/bash -l",
+        guest_bootstrap_body(instance_id, shares, guest_env, verbose, interactive)
+    );
+
+    format!("bash -lc {}", shell_quote(&body))
+}
+
+fn guest_exec_command(
+    instance_id: &str,
+    shares: &[ShareMount],
+    guest_env: &[GuestEnvVar],
+    verbose: bool,
+    guest_command: &GuestExecCommand,
+) -> String {
+    let exec_env_exports = guest_command
+        .env
+        .iter()
+        .map(|var| format!(" export {}={};", var.name, shell_quote(&var.value)))
+        .collect::<String>();
+    let exec_cwd = guest_command
+        .cwd
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(GUEST_WORKSPACE_PATH);
+    let exec_argv = std::iter::once(guest_command.command.as_str())
+        .chain(guest_command.args.iter().map(String::as_str))
+        .map(shell_quote)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let body = format!(
+        "{}{} cd {}; exec {}",
+        guest_bootstrap_body(instance_id, shares, guest_env, verbose, false),
+        exec_env_exports,
+        shell_quote(exec_cwd),
+        exec_argv
+    );
+
+    format!("bash -lc {}", shell_quote(&body))
+}
+
+fn guest_bootstrap_body(
+    instance_id: &str,
+    shares: &[ShareMount],
+    guest_env: &[GuestEnvVar],
+    verbose: bool,
+    interactive: bool,
+) -> String {
     let mut share_mounts = String::new();
     for (index, share) in shares.iter().enumerate() {
         let path = shell_quote(&share.guest_path.display().to_string());
@@ -632,14 +754,12 @@ fn guest_shell_command(
         "if command -v cloud-init >/dev/null 2>&1; then sudo cloud-init status --wait >/dev/null 2>&1 || true; fi;"
     };
 
-    let body = format!(
-        "{cloud_init_wait} ROOT_DEV=\"$(findmnt -n -o SOURCE / 2>/dev/null || true)\"; ROOT_FS=\"$(findmnt -n -o FSTYPE / 2>/dev/null || true)\"; if command -v growpart >/dev/null 2>&1 && [ -n \"$ROOT_DEV\" ]; then PARENT_DEV=\"/dev/$(lsblk -no PKNAME \"$ROOT_DEV\" 2>/dev/null || true)\"; PART_NUM=\"$(lsblk -no PARTN \"$ROOT_DEV\" 2>/dev/null || true)\"; if [ -n \"$PARENT_DEV\" ] && [ -n \"$PART_NUM\" ]; then sudo growpart \"$PARENT_DEV\" \"$PART_NUM\" >/dev/null 2>&1 || true; fi; fi; if [ -n \"$ROOT_DEV\" ]; then case \"$ROOT_FS\" in ext2|ext3|ext4) if command -v resize2fs >/dev/null 2>&1; then sudo resize2fs \"$ROOT_DEV\" >/dev/null 2>&1 || true; fi ;; xfs) if command -v xfs_growfs >/dev/null 2>&1; then sudo xfs_growfs / >/dev/null 2>&1 || true; fi ;; esac; fi; ulimit -n {nofile_limit} >/dev/null 2>&1 || true; if [ -e /workspace ] && [ ! -d /workspace ]; then sudo rm -f /workspace; fi; sudo mkdir -p /workspace; if ! mountpoint -q /workspace; then sudo mount -t virtiofs workspace /workspace >/dev/null 2>&1 || true; fi;{share_mounts}{guest_env_exports}{title_setup}{git_identity_sync} ln -sfn {workspace_path} \"$HOME/workspace\"; cd {workspace_path} 2>/dev/null || cd \"$HOME\"; exec /bin/bash -l",
+    format!(
+        "{cloud_init_wait} ROOT_DEV=\"$(findmnt -n -o SOURCE / 2>/dev/null || true)\"; ROOT_FS=\"$(findmnt -n -o FSTYPE / 2>/dev/null || true)\"; if command -v growpart >/dev/null 2>&1 && [ -n \"$ROOT_DEV\" ]; then PARENT_DEV=\"/dev/$(lsblk -no PKNAME \"$ROOT_DEV\" 2>/dev/null || true)\"; PART_NUM=\"$(lsblk -no PARTN \"$ROOT_DEV\" 2>/dev/null || true)\"; if [ -n \"$PARENT_DEV\" ] && [ -n \"$PART_NUM\" ]; then sudo growpart \"$PARENT_DEV\" \"$PART_NUM\" >/dev/null 2>&1 || true; fi; fi; if [ -n \"$ROOT_DEV\" ]; then case \"$ROOT_FS\" in ext2|ext3|ext4) if command -v resize2fs >/dev/null 2>&1; then sudo resize2fs \"$ROOT_DEV\" >/dev/null 2>&1 || true; fi ;; xfs) if command -v xfs_growfs >/dev/null 2>&1; then sudo xfs_growfs / >/dev/null 2>&1 || true; fi ;; esac; fi; ulimit -n {nofile_limit} >/dev/null 2>&1 || true; if [ -e /workspace ] && [ ! -d /workspace ]; then sudo rm -f /workspace; fi; sudo mkdir -p /workspace; if ! mountpoint -q /workspace; then sudo mount -t virtiofs workspace /workspace >/dev/null 2>&1 || true; fi;{share_mounts}{guest_env_exports}{title_setup}{git_identity_sync} ln -sfn {workspace_path} \"$HOME/workspace\"; cd {workspace_path} 2>/dev/null || cd \"$HOME\";",
         nofile_limit = GUEST_NOFILE_LIMIT,
         title_setup = title_setup,
         workspace_path = GUEST_WORKSPACE_PATH,
-    );
-
-    format!("bash -lc {}", shell_quote(&body))
+    )
 }
 
 fn ssh_base_command(
