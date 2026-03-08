@@ -13,7 +13,7 @@ use ratatui::widgets::{Clear, Paragraph};
 use std::env;
 use std::fs;
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -539,15 +539,17 @@ fn connect_ssh(
     guest_env: &[GuestEnvVar],
     verbose: bool,
 ) -> Result<i32, String> {
+    let interactive = io::stdin().is_terminal();
     let mut command = ssh_base_command(ssh_user, ssh_private_key, known_hosts, vmnet, true);
     command
-        .arg("-tt")
+        .arg(if interactive { "-tt" } else { "-T" })
         .arg(format!("{ssh_user}@{}", vmnet.guest_ip))
         .arg(guest_shell_command(
             &instance.id,
             shares,
             guest_env,
             verbose,
+            interactive,
         ));
 
     let status = command.status().map_err(|err| err.to_string())?;
@@ -603,6 +605,7 @@ fn guest_shell_command(
     shares: &[ShareMount],
     guest_env: &[GuestEnvVar],
     verbose: bool,
+    interactive: bool,
 ) -> String {
     let mut share_mounts = String::new();
     for (index, share) in shares.iter().enumerate() {
@@ -616,7 +619,11 @@ fn guest_shell_command(
         .iter()
         .map(|var| format!(" export {}={};", var.name, shell_quote(&var.value)))
         .collect::<String>();
-    let title_setup = format!(" printf '\\033]0;%s\\007' {};", shell_quote(instance_id));
+    let title_setup = if interactive {
+        format!(" printf '\\033]0;%s\\007' {};", shell_quote(instance_id))
+    } else {
+        String::new()
+    };
     let git_identity_sync = " if command -v git >/dev/null 2>&1; then if [ -n \"${GIT_AUTHOR_NAME:-}\" ]; then git config --global user.name \"$GIT_AUTHOR_NAME\" >/dev/null 2>&1 || true; fi; if [ -n \"${GIT_AUTHOR_EMAIL:-}\" ]; then git config --global user.email \"$GIT_AUTHOR_EMAIL\" >/dev/null 2>&1 || true; fi; fi;";
 
     let cloud_init_wait = if verbose {
@@ -1112,6 +1119,7 @@ mod tests {
                 value: "sk-ant-abc123".to_string(),
             }],
             true,
+            true,
         );
         assert!(command.contains("cloud-init status --wait"));
         assert!(command.contains("waiting for cloud-init/bootstrap"));
@@ -1132,11 +1140,18 @@ mod tests {
 
     #[test]
     fn quiet_guest_shell_suppresses_bootstrap_chatter() {
-        let command = guest_shell_command("markless-main", &[], &[], false);
+        let command = guest_shell_command("markless-main", &[], &[], false, true);
         assert!(command.contains("cloud-init status --wait >/dev/null 2>&1"));
         assert!(!command.contains("waiting for cloud-init/bootstrap"));
         assert!(!command.contains("bootstrap log:"));
         assert!(!command.contains("/var/log/yolobox-init.log"));
+    }
+
+    #[test]
+    fn noninteractive_guest_shell_keeps_login_shell_and_skips_title_escape() {
+        let command = guest_shell_command("markless-main", &[], &[], false, false);
+        assert!(command.contains("exec /bin/bash -l"));
+        assert!(!command.contains("\\033]0;"));
     }
 
     #[test]

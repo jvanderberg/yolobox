@@ -47,6 +47,18 @@ Check readiness:
 yolobox doctor
 ```
 
+For a one-shot setup, use the installer script:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jvanderberg/yolobox/main/scripts/setup.sh | bash -s -- install
+```
+
+Run it locally from a checkout with:
+
+```bash
+./scripts/setup.sh install
+```
+
 ## Getting a Base Image
 
 Any Linux image that supports EFI boot, `cloud-init`, `sshd`, `virtio-blk`, and `virtio-fs` will work. Ubuntu cloud images are a good default:

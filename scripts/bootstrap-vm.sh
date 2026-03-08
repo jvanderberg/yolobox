@@ -8,6 +8,7 @@ apt_packages=(
   ca-certificates
   curl
   gcc
+  gh
   git
   pkg-config
   libssl-dev
@@ -92,6 +93,7 @@ Installed:
 - vite and create-vite globally
 - OpenAI Codex CLI globally
 - Claude Code globally
+- GitHub CLI
 - python3-pip, python3-venv, pipx
 - common native build dependencies
 EOF

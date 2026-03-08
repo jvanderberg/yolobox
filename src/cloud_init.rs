@@ -388,6 +388,9 @@ fn render_runcmd(user: &str, shares: &[ShareMount], includes_init_script: bool) 
     let mut lines = vec![
         "  - [ sh, -lc, \"if ! dpkg -s avahi-daemon >/dev/null 2>&1; then apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y avahi-daemon; fi\" ]".to_string(),
         "  - [ systemctl, enable, --now, avahi-daemon ]".to_string(),
+        format!(
+            "  - [ sh, -lc, \"mkdir -p /home/{user} && chown {user}:{user} /home/{user}\" ]"
+        ),
         "  - [ sh, -lc, \"if [ -e /workspace ] && [ ! -d /workspace ]; then rm -f /workspace; fi; mkdir -p /workspace; mountpoint -q /workspace || mount /workspace || true\" ]".to_string(),
     ];
     for (index, share) in shares.iter().enumerate() {
@@ -532,6 +535,7 @@ mod tests {
         assert!(rendered.contains("rm -f /workspace"));
         assert!(rendered.contains("apt-get install -y avahi-daemon"));
         assert!(rendered.contains("systemctl, enable, --now, avahi-daemon"));
+        assert!(rendered.contains("mkdir -p /home/vibe && chown vibe:vibe /home/vibe"));
         assert!(rendered.contains("path: /etc/security/limits.d/99-yolobox.conf"));
         assert!(rendered.contains("path: /etc/profile.d/yolobox-ai.sh"));
         assert!(rendered.contains("* soft nofile 65536"));
@@ -569,6 +573,7 @@ mod tests {
         assert!(rendered.contains("sudo touch /var/lib/yolobox/init.done"));
         assert!(rendered.contains("apt-get install -y avahi-daemon"));
         assert!(rendered.contains("systemctl, enable, --now, avahi-daemon"));
+        assert!(rendered.contains("mkdir -p /home/vibe && chown vibe:vibe /home/vibe"));
         assert!(rendered.contains("path: /etc/security/limits.d/99-yolobox.conf"));
         assert!(rendered.contains("path: /etc/profile.d/yolobox-ai.sh"));
         assert!(rendered.contains("[ share0, \"/mnt/share\", virtiofs"));
