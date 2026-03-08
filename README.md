@@ -1,13 +1,27 @@
 # yolobox
 
-Branch-scoped Linux VMs for local development on macOS. Each repo branch gets its own persistent VM with a writable root disk, a shared git checkout, and a stable network identity.
+Branch-scoped Micro-VMs for AI safe development on macOS. 
+Each branch gets its own persistent VM with a writable root disk,
+ a shared git checkout, and a stable network identity.
 
 ```bash
-yolobox base import --name ubuntu --image ./ubuntu-jammy-arm64.raw
+' Launch a new VM
+yolobox
+
+' Check out a git branch in a new VM
 yolobox --repo git@github.com:org/repo.git --branch main
 ```
 
-You're dropped into a Linux shell with your repo at `/workspace`, your SSH agent forwarded, and guest services reachable from the host at `<project>-<branch>.local` (e.g. `repo-main.local`).
+You're dropped into shell with your repo at `/workspace`, 
+your SSH agent forwarded, and network services reachable from the host 
+at `<project>-<branch>.local` (e.g. `repo-main.local`).
+
+New VM creation/boot takes about 15 seconds, subsequent launches take less than a second.
+
+## Yolo mode
+
+Claude and Codex are pre-installed in the environment and are set to automatically
+user their respective --dangerously-skip
 
 ## How It Works
 
@@ -19,57 +33,45 @@ You're dropped into a Linux shell with your repo at `/workspace`, your SSH agent
 
 Instances are persistent. Relaunching the same repo+branch reuses the existing root disk and checkout.
 
-## Prerequisites
+## Install
 
-macOS on an APFS volume, plus:
+The recommended path is the installer script.
 
-```bash
-# VM runtime
-brew tap slp/krunkit
-brew install krunkit
-
-# Networking
-curl -fsSL https://raw.githubusercontent.com/nirs/vmnet-helper/main/install.sh | sudo bash
-
-# Image conversion (only if your base image is qcow2)
-brew install qemu
-```
-
-You need an SSH key at `~/.ssh/id_ed25519`, `id_ecdsa`, or `id_rsa`. Create one if you don't have it:
-
-```bash
-ssh-keygen -t ed25519
-```
-
-Check readiness:
-
-```bash
-yolobox doctor
-```
-
-For a one-shot setup, use the installer script:
+Run it directly from GitHub:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/jvanderberg/yolobox/main/scripts/setup.sh | bash -s -- install
 ```
 
-Run it locally from a checkout with:
+Or run it from a local checkout:
 
 ```bash
+git clone https://github.com/jvanderberg/yolobox.git
+cd yolobox
 ./scripts/setup.sh install
 ```
 
-## Getting a Base Image
+The installer:
 
-Any Linux image that supports EFI boot, `cloud-init`, `sshd`, `virtio-blk`, and `virtio-fs` will work. Ubuntu cloud images are a good default:
+- installs host dependencies
+- builds and installs `yolobox`
+- downloads the Ubuntu cloud image
+- imports a clean `ubuntu` base
+- provisions and captures an `ubuntu-dev` base
+
+Check readiness afterward:
 
 ```bash
-curl -LO https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-arm64.img
-qemu-img convert -f qcow2 -O raw jammy-server-cloudimg-arm64.img ubuntu-jammy-arm64.raw
-yolobox base import --name ubuntu --image ./ubuntu-jammy-arm64.raw
+yolobox doctor
 ```
 
-Skip the `qemu-img` step if your download is already a raw image.
+For a manual install and base-image setup, see [manual-install.md](/Users/joshv/git/local_sprite/manual-install.md).
+
+## Getting a Base Image
+
+The installer prepares the default Ubuntu-backed bases for you.
+
+If you want to import your own image manually or manage bases by hand, use the instructions in [manual-install.md](/Users/joshv/git/local_sprite/manual-install.md).
 
 ## Usage
 

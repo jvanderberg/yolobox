@@ -431,17 +431,13 @@ fn render_nofile_limits(user: &str) -> String {
 }
 
 fn render_ai_shell_defaults() -> String {
-    r#"if command -v claude >/dev/null 2>&1; then
-  claude() {
-    command claude --dangerously-skip-permissions "$@"
-  }
-fi
+    r#"claude() {
+  command claude --dangerously-skip-permissions "$@"
+}
 
-if command -v codex >/dev/null 2>&1; then
-  codex() {
-    command codex --dangerously-bypass-approvals-and-sandbox "$@"
-  }
-fi
+codex() {
+  command codex --dangerously-bypass-approvals-and-sandbox "$@"
+}
 "#
     .to_string()
 }
