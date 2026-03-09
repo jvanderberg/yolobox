@@ -33,6 +33,7 @@ The new image takes almost no extra space on disk, only changes are stored. All 
 for the life of the VM, and scoped to only that VM.
 
 krunkit orchestrates the VM, mapping the git repo in using virtio-fs, mounted as /workspace.
+It also mounts a per-instance control and integration directory at /yolobox.
 
 vmnet-helper gives the VM an IP on your local network, and avahi-daemon broadcasts a .local domain name using mDNS.
 
@@ -175,6 +176,37 @@ These are `virtio-fs` mounts, so they persist like any other share.
 
 yolobox also installs a profile script in the guest that makes `claude` run with `--dangerously-skip-permissions` and `codex` run with `--dangerously-bypass-approvals-and-sandbox` by default. Use `command claude ...` or `command codex ...` if you want the raw CLI behavior in a shell.
 
+Shared skills and host-bridge guidance are also populated under `/yolobox/skills`.
+Bridge helper scripts are populated under `/yolobox/scripts`.
+
+When using an agent inside the guest, tell it to read the relevant files under `/yolobox/skills` before it starts working. A good prompt is:
+
+```text
+You are running inside yolobox on a macOS host.
+Before you begin, read the relevant guidance under /yolobox/skills/common and /yolobox/skills/<agent>.
+Follow the yolobox host-bridge instructions there for opening artifacts, importing clipboard images, and telling me how to access guest services from the host.
+```
+
+The default skills cover two main areas:
+
+`/yolobox/skills/common/yolobox.md`
+Explains the yolobox environment boundary: `/workspace` vs `/yolobox`, host-visible artifact paths, clipboard-import paths, the host bridge scripts, and the fact that host users must access guest services via the instance `.local` hostname instead of guest `localhost`.
+
+`/yolobox/skills/<agent>/yolobox.md`
+Provides agent-specific usage guidance for the same environment. Right now the Codex and Claude variants both tell the agent to use `/yolobox/scripts/yolobox-open` for host-visible artifacts, `/yolobox/scripts/yolobox-paste-image` for clipboard image import, and mDNS URLs like `http://<instance>.local:<port>` for guest services.
+
+### Host Bridge Helpers
+
+Built-in guest helper commands are provided under `/yolobox/scripts` for narrow host interactions:
+
+`/yolobox/scripts/yolobox-open /workspace/.artifacts/report/index.html`
+Requests that the macOS host open an allowlisted artifact file.
+
+`/yolobox/scripts/yolobox-paste-image /yolobox/inputs/clipboard.png`
+Requests that the macOS host import the current clipboard image to a shared file. Clipboard imports require confirmation on the host.
+
+These helpers do not expose arbitrary host command execution. They communicate with a host-side listener through the shared `/yolobox` runtime mount.
+
 ### Init Scripts
 
 Run a first-boot script inside the guest:
@@ -223,6 +255,8 @@ ssh josh@myrepo-main.local
 
 yolobox does not create localhost port forwards. The guest gets a deterministic static IP on the `192.168.105.0/24` subnet (derived from the instance ID), and `avahi-daemon` advertises its hostname over mDNS.
 
+If you start a dev server in the guest, tell the host to open `http://<instance>.local:<port>`, not `http://localhost:<port>`.
+
 ## Instance Layout
 
 All state lives under `~/.local/state/yolobox` (override with `YOLOBOX_HOME`):
@@ -240,6 +274,12 @@ All state lives under `~/.local/state/yolobox` (override with `YOLOBOX_HOME`):
     runtime/
       console.log         # VM console output
       krunkit.pid         # process tracking
+      yolobox/
+        requests/         # guest-to-host bridge requests
+        responses/        # host-to-guest bridge responses
+        inputs/           # imported host inputs such as clipboard images
+        scripts/          # guest helper scripts exposed at /yolobox/scripts
+        skills/           # default agent/environment skills exposed at /yolobox/skills
 ```
 
 Branch disks default to a sparse 32 GiB rootfs (override with `YOLOBOX_ROOTFS_MIB`). The guest partition and filesystem are grown automatically on first boot.

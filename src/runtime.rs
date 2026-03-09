@@ -1,3 +1,5 @@
+use crate::host_bridge;
+use crate::host_bridge::ManagedMount;
 use crate::network::VmnetConfig;
 use crate::ports::PortMapping;
 use crate::state::{GuestEnvVar, Instance, ShareMount};
@@ -54,6 +56,7 @@ pub struct LaunchConfig {
     pub ssh_pubkey_path: Option<PathBuf>,
     pub ssh_private_key_path: Option<PathBuf>,
     pub init_script_path: Option<PathBuf>,
+    pub host_bridge_mounts: Vec<ManagedMount>,
     pub shares: Vec<ShareMount>,
     pub guest_env: Vec<GuestEnvVar>,
     pub verbose: bool,
@@ -176,6 +179,17 @@ pub fn launch_summary(instance: &Instance, config: &LaunchConfig) -> Vec<String>
     if let Some(path) = &config.init_script_path {
         lines.push(format!("init_script: {}", path.display()));
     }
+    if !config.host_bridge_mounts.is_empty() {
+        lines.push("guest_bridge: mounted under /yolobox".to_string());
+        for mount in &config.host_bridge_mounts {
+            lines.push(format!(
+                "guest_bridge_mount: {} -> {} ({})",
+                mount.host_path.display(),
+                mount.guest_path.display(),
+                if mount.readonly { "ro" } else { "rw" }
+            ));
+        }
+    }
     if let Some(vmnet) = &config.vmnet {
         lines.extend(vmnet.summary_lines());
     }
@@ -202,11 +216,13 @@ pub fn launch_summary(instance: &Instance, config: &LaunchConfig) -> Vec<String>
 
     if config.cloud_init_image.is_some() {
         lines.push("guest_workspace: auto-mounted at /workspace via cloud-init".to_string());
+        lines.push("guest_bridge: auto-mounted at /yolobox via cloud-init".to_string());
     } else {
         lines.push(format!(
             "guest_workspace: mount -t virtiofs {} /workspace",
             DEFAULT_WORKSPACE_TAG
         ));
+        lines.push("guest_bridge: mounted under /yolobox".to_string());
     }
     lines
 }
@@ -272,6 +288,14 @@ fn launch_external(
         .env(
             "YOLOBOX_HOSTNAME",
             config.hostname.as_deref().unwrap_or_default(),
+        )
+        .env(
+            "YOLOBOX_HOST_BRIDGE",
+            config
+                .host_bridge_mounts
+                .first()
+                .map(|mount| mount.host_path.as_os_str())
+                .unwrap_or_default(),
         )
         .env("YOLOBOX_SHARES", encode_env_shares(&config.shares))
         .env(
@@ -360,7 +384,7 @@ fn ensure_krunkit_vm_ready(
     let shares_path = runtime_dir.join("shares");
 
     if instance_has_running_vm(&instance.instance_dir)? {
-        if running_vm_matches_shares(&shares_path, &config.shares)? {
+        if running_vm_matches_shares(&shares_path, &config.shares, &config.host_bridge_mounts)? {
             if config.verbose {
                 eprintln!("reconnecting to running vm for {}", instance.id);
             }
@@ -396,7 +420,7 @@ fn ensure_krunkit_vm_ready(
     stop_instance_vm(&instance.instance_dir)?;
     stop_vmnet_helper_interface(&vmnet.interface_id)?;
     remove_if_exists(&known_hosts)?;
-    write_runtime_shares(&shares_path, &config.shares)?;
+    write_runtime_shares(&shares_path, &config.shares, &config.host_bridge_mounts)?;
 
     let stdout_file = File::create(&krunkit_log).map_err(|err| err.to_string())?;
     let stderr_file = stdout_file.try_clone().map_err(|err| err.to_string())?;
@@ -443,6 +467,13 @@ fn ensure_krunkit_vm_ready(
             instance.checkout_dir.display(),
             DEFAULT_WORKSPACE_TAG
         ));
+    for bridge in &config.host_bridge_mounts {
+        command.arg("--device").arg(format!(
+            "virtio-fs,sharedDir={},mountTag={}",
+            bridge.host_path.display(),
+            bridge.tag
+        ));
+    }
     for (index, share) in config.shares.iter().enumerate() {
         command.arg("--device").arg(format!(
             "virtio-fs,sharedDir={},mountTag={}",
@@ -587,6 +618,7 @@ fn connect_ssh(
     verbose: bool,
 ) -> Result<i32, String> {
     let interactive = io::stdin().is_terminal();
+    let _bridge = host_bridge::start(instance)?;
     let mut command = ssh_base_command(ssh_user, ssh_private_key, known_hosts, vmnet, true);
     command
         .arg(if interactive { "-tt" } else { "-T" })
@@ -614,6 +646,7 @@ fn exec_ssh(
     verbose: bool,
     guest_command: &GuestExecCommand,
 ) -> Result<i32, String> {
+    let _bridge = host_bridge::start(instance)?;
     let mut command = ssh_base_command(ssh_user, ssh_private_key, known_hosts, vmnet, false);
     command
         .arg("-T")
@@ -729,6 +762,17 @@ fn guest_bootstrap_body(
     verbose: bool,
     interactive: bool,
 ) -> String {
+    let bridge_mounts = host_bridge::managed_mount_specs()
+        .iter()
+        .map(|spec| {
+            let guest_path = shell_quote(spec.guest_path);
+            let mount_options = if spec.readonly { " -o ro" } else { "" };
+            format!(
+                " if [ -e {guest_path} ] && [ ! -d {guest_path} ]; then sudo rm -f {guest_path}; fi; sudo mkdir -p {guest_path}; if ! mountpoint -q {guest_path}; then sudo mount -t virtiofs{mount_options} {tag} {guest_path} >/dev/null 2>&1 || true; fi;",
+                tag = spec.tag
+            )
+        })
+        .collect::<String>();
     let mut share_mounts = String::new();
     for (index, share) in shares.iter().enumerate() {
         let path = shell_quote(&share.guest_path.display().to_string());
@@ -755,7 +799,8 @@ fn guest_bootstrap_body(
     };
 
     format!(
-        "{cloud_init_wait} ROOT_DEV=\"$(findmnt -n -o SOURCE / 2>/dev/null || true)\"; ROOT_FS=\"$(findmnt -n -o FSTYPE / 2>/dev/null || true)\"; if command -v growpart >/dev/null 2>&1 && [ -n \"$ROOT_DEV\" ]; then PARENT_DEV=\"/dev/$(lsblk -no PKNAME \"$ROOT_DEV\" 2>/dev/null || true)\"; PART_NUM=\"$(lsblk -no PARTN \"$ROOT_DEV\" 2>/dev/null || true)\"; if [ -n \"$PARENT_DEV\" ] && [ -n \"$PART_NUM\" ]; then sudo growpart \"$PARENT_DEV\" \"$PART_NUM\" >/dev/null 2>&1 || true; fi; fi; if [ -n \"$ROOT_DEV\" ]; then case \"$ROOT_FS\" in ext2|ext3|ext4) if command -v resize2fs >/dev/null 2>&1; then sudo resize2fs \"$ROOT_DEV\" >/dev/null 2>&1 || true; fi ;; xfs) if command -v xfs_growfs >/dev/null 2>&1; then sudo xfs_growfs / >/dev/null 2>&1 || true; fi ;; esac; fi; ulimit -n {nofile_limit} >/dev/null 2>&1 || true; if [ -e /workspace ] && [ ! -d /workspace ]; then sudo rm -f /workspace; fi; sudo mkdir -p /workspace; if ! mountpoint -q /workspace; then sudo mount -t virtiofs workspace /workspace >/dev/null 2>&1 || true; fi;{share_mounts}{guest_env_exports}{title_setup}{git_identity_sync} ln -sfn {workspace_path} \"$HOME/workspace\"; cd {workspace_path} 2>/dev/null || cd \"$HOME\";",
+        "{cloud_init_wait} ROOT_DEV=\"$(findmnt -n -o SOURCE / 2>/dev/null || true)\"; ROOT_FS=\"$(findmnt -n -o FSTYPE / 2>/dev/null || true)\"; if command -v growpart >/dev/null 2>&1 && [ -n \"$ROOT_DEV\" ]; then PARENT_DEV=\"/dev/$(lsblk -no PKNAME \"$ROOT_DEV\" 2>/dev/null || true)\"; PART_NUM=\"$(lsblk -no PARTN \"$ROOT_DEV\" 2>/dev/null || true)\"; if [ -n \"$PARENT_DEV\" ] && [ -n \"$PART_NUM\" ]; then sudo growpart \"$PARENT_DEV\" \"$PART_NUM\" >/dev/null 2>&1 || true; fi; fi; if [ -n \"$ROOT_DEV\" ]; then case \"$ROOT_FS\" in ext2|ext3|ext4) if command -v resize2fs >/dev/null 2>&1; then sudo resize2fs \"$ROOT_DEV\" >/dev/null 2>&1 || true; fi ;; xfs) if command -v xfs_growfs >/dev/null 2>&1; then sudo xfs_growfs / >/dev/null 2>&1 || true; fi ;; esac; fi; ulimit -n {nofile_limit} >/dev/null 2>&1 || true; if [ -e /workspace ] && [ ! -d /workspace ]; then sudo rm -f /workspace; fi; sudo mkdir -p /workspace; if ! mountpoint -q /workspace; then sudo mount -t virtiofs workspace /workspace >/dev/null 2>&1 || true; fi; if [ -e /yolobox ] && [ ! -d /yolobox ]; then sudo rm -f /yolobox; fi; sudo mkdir -p /yolobox;{bridge_mounts}{share_mounts}{guest_env_exports}{title_setup}{git_identity_sync} ln -sfn {workspace_path} \"$HOME/workspace\"; cd {workspace_path} 2>/dev/null || cd \"$HOME\";",
+        bridge_mounts = bridge_mounts,
         nofile_limit = GUEST_NOFILE_LIMIT,
         title_setup = title_setup,
         workspace_path = GUEST_WORKSPACE_PATH,
@@ -1159,16 +1204,41 @@ fn encode_guest_env_names(vars: &[GuestEnvVar]) -> String {
         .join(",")
 }
 
-fn write_runtime_shares(path: &Path, shares: &[ShareMount]) -> Result<(), String> {
-    fs::write(path, encode_env_shares(shares)).map_err(|err| err.to_string())
+fn encode_runtime_mounts(shares: &[ShareMount], host_bridge_mounts: &[ManagedMount]) -> String {
+    let mut mounts = Vec::new();
+    for mount in host_bridge_mounts {
+        mounts.push(format!(
+            "{}:{}:{}:{}",
+            mount.host_path.display(),
+            mount.guest_path.display(),
+            mount.tag,
+            if mount.readonly { "ro" } else { "rw" }
+        ));
+    }
+    if !shares.is_empty() {
+        mounts.push(encode_env_shares(shares));
+    }
+    mounts.join(",")
 }
 
-fn running_vm_matches_shares(path: &Path, shares: &[ShareMount]) -> Result<bool, String> {
+fn write_runtime_shares(
+    path: &Path,
+    shares: &[ShareMount],
+    host_bridge_mounts: &[ManagedMount],
+) -> Result<(), String> {
+    fs::write(path, encode_runtime_mounts(shares, host_bridge_mounts)).map_err(|err| err.to_string())
+}
+
+fn running_vm_matches_shares(
+    path: &Path,
+    shares: &[ShareMount],
+    host_bridge_mounts: &[ManagedMount],
+) -> Result<bool, String> {
     if !path.exists() {
-        return Ok(shares.is_empty());
+        return Ok(shares.is_empty() && host_bridge_mounts.is_empty());
     }
     let current = fs::read_to_string(path).map_err(|err| err.to_string())?;
-    Ok(current == encode_env_shares(shares))
+    Ok(current == encode_runtime_mounts(shares, host_bridge_mounts))
 }
 
 fn share_tag(index: usize) -> String {
@@ -1194,6 +1264,7 @@ mod tests {
         running_vm_matches_shares, share_tag, should_probe_ssh, ssh_base_command,
         ssh_ready_timeout, stop_stale_vm, write_runtime_shares,
     };
+    use crate::host_bridge::ManagedMount;
     use crate::network::VmnetConfig;
     use crate::ports::PortMapping;
     use crate::state::{GuestEnvVar, ShareMount};
@@ -1250,6 +1321,11 @@ mod tests {
         assert!(command.contains("resize2fs"));
         assert!(command.contains("rm -f /workspace"));
         assert!(command.contains("mount -t virtiofs workspace /workspace"));
+        assert!(command.contains("mount -t virtiofs"));
+        assert!(command.contains("yolobox-requests"));
+        assert!(command.contains("/yolobox/requests"));
+        assert!(command.contains("yolobox-responses"));
+        assert!(command.contains("/yolobox/responses"));
         assert!(command.contains(&format!("mount -t virtiofs {}", share_tag(0))));
         assert!(command.contains("/mnt/share"));
         assert!(command.contains("export ANTHROPIC_API_KEY="));
@@ -1426,9 +1502,24 @@ mod tests {
             host_path: PathBuf::from("/tmp/host"),
             guest_path: PathBuf::from("/mnt/guest"),
         }];
-        write_runtime_shares(&path, &shares).unwrap();
-        assert!(running_vm_matches_shares(&path, &shares).unwrap());
-        assert!(!running_vm_matches_shares(&path, &[]).unwrap());
+        let bridge_mounts = vec![
+            ManagedMount {
+                host_path: PathBuf::from("/tmp/yolobox/requests"),
+                guest_path: PathBuf::from("/yolobox/requests"),
+                tag: "yolobox-requests",
+                readonly: false,
+            },
+            ManagedMount {
+                host_path: PathBuf::from("/tmp/yolobox/responses"),
+                guest_path: PathBuf::from("/yolobox/responses"),
+                tag: "yolobox-responses",
+                readonly: true,
+            },
+        ];
+        write_runtime_shares(&path, &shares, &bridge_mounts).unwrap();
+        assert!(running_vm_matches_shares(&path, &shares, &bridge_mounts).unwrap());
+        assert!(!running_vm_matches_shares(&path, &shares, &[]).unwrap());
+        assert!(!running_vm_matches_shares(&path, &[], &bridge_mounts).unwrap());
         let _ = fs::remove_file(&path);
     }
 }

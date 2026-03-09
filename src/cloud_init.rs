@@ -1,3 +1,4 @@
+use crate::host_bridge;
 use crate::network::VmnetConfig;
 use crate::state::{Instance, ShareMount};
 use std::env;
@@ -357,9 +358,21 @@ fi
 }
 
 fn render_mounts(shares: &[ShareMount]) -> String {
-    let mut lines = vec![
-        "  - [ workspace, /workspace, virtiofs, \"defaults,nofail\", \"0\", \"0\" ]".to_string(),
-    ];
+    let mut lines =
+        vec!["  - [ workspace, /workspace, virtiofs, \"defaults,nofail\", \"0\", \"0\" ]".to_string()];
+    lines.extend(host_bridge::managed_mount_specs().iter().map(|spec| {
+        let options = if spec.readonly {
+            "ro,defaults,nofail"
+        } else {
+            "defaults,nofail"
+        };
+        format!(
+            "  - [ {}, \"{}\", virtiofs, \"{}\", \"0\", \"0\" ]",
+            spec.tag,
+            yaml_escape(spec.guest_path),
+            options
+        )
+    }));
     for (index, share) in shares.iter().enumerate() {
         lines.push(format!(
             "  - [ {}, \"{}\", virtiofs, \"defaults,nofail\", \"0\", \"0\" ]",
@@ -373,7 +386,14 @@ fn render_mounts(shares: &[ShareMount]) -> String {
 fn render_bootcmd(shares: &[ShareMount]) -> String {
     let mut lines = vec![
         "  - [ sh, -lc, \"if [ -e /workspace ] && [ ! -d /workspace ]; then rm -f /workspace; fi; mkdir -p /workspace\" ]".to_string(),
+        "  - [ sh, -lc, \"if [ -e /yolobox ] && [ ! -d /yolobox ]; then rm -f /yolobox; fi; mkdir -p /yolobox\" ]".to_string(),
     ];
+    lines.extend(host_bridge::managed_mount_specs().iter().map(|spec| {
+        format!(
+            "  - [ sh, -lc, \"if [ -e {path} ] && [ ! -d {path} ]; then rm -f {path}; fi; mkdir -p {path}\" ]",
+            path = shell_quote(spec.guest_path)
+        )
+    }));
     for (index, share) in shares.iter().enumerate() {
         let _ = index;
         lines.push(format!(
@@ -392,7 +412,20 @@ fn render_runcmd(user: &str, shares: &[ShareMount], includes_init_script: bool) 
             "  - [ sh, -lc, \"mkdir -p /home/{user} && chown {user}:{user} /home/{user}\" ]"
         ),
         "  - [ sh, -lc, \"if [ -e /workspace ] && [ ! -d /workspace ]; then rm -f /workspace; fi; mkdir -p /workspace; mountpoint -q /workspace || mount /workspace || true\" ]".to_string(),
+        "  - [ sh, -lc, \"if [ -e /yolobox ] && [ ! -d /yolobox ]; then rm -f /yolobox; fi; mkdir -p /yolobox\" ]".to_string(),
     ];
+    lines.extend(host_bridge::managed_mount_specs().iter().map(|spec| {
+        let mount_args = if spec.readonly {
+            format!("-o ro {} {}", spec.tag, shell_quote(spec.guest_path))
+        } else {
+            format!("{} {}", spec.tag, shell_quote(spec.guest_path))
+        };
+        format!(
+            "  - [ sh, -lc, \"if [ -e {path} ] && [ ! -d {path} ]; then rm -f {path}; fi; mkdir -p {path}; mountpoint -q {path} || mount -t virtiofs {mount_args} >/dev/null 2>&1 || true\" ]",
+            path = shell_quote(spec.guest_path),
+            mount_args = mount_args
+        )
+    }));
     for (index, share) in shares.iter().enumerate() {
         let _ = index;
         lines.push(format!(
@@ -529,6 +562,7 @@ mod tests {
         assert!(rendered.contains("uid: 501"));
         assert!(rendered.contains("ssh-ed25519 AAAATEST"));
         assert!(rendered.contains("rm -f /workspace"));
+        assert!(rendered.contains("mkdir -p /yolobox"));
         assert!(rendered.contains("apt-get install -y avahi-daemon"));
         assert!(rendered.contains("systemctl, enable, --now, avahi-daemon"));
         assert!(rendered.contains("mkdir -p /home/vibe && chown vibe:vibe /home/vibe"));
@@ -538,6 +572,8 @@ mod tests {
         assert!(rendered.contains("command claude --dangerously-skip-permissions"));
         assert!(rendered.contains("command codex --dangerously-bypass-approvals-and-sandbox"));
         assert!(rendered.contains("workspace, /workspace, virtiofs"));
+        assert!(rendered.contains("yolobox-requests, \"/yolobox/requests\", virtiofs"));
+        assert!(rendered.contains("yolobox-responses, \"/yolobox/responses\", virtiofs, \"ro,defaults,nofail\""));
         assert!(rendered.contains("ln, -sfn, /workspace, /home/vibe/workspace"));
     }
 

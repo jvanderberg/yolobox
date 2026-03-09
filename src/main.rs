@@ -1,6 +1,7 @@
 mod app;
 mod cloud_init;
 mod git;
+mod host_bridge;
 mod network;
 mod ports;
 mod runtime;

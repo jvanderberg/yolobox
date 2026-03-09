@@ -1,5 +1,6 @@
 use crate::cloud_init::{self, CloudInitOptions};
 use crate::git;
+use crate::host_bridge;
 use crate::network;
 use crate::runtime::{self, GuestExecCommand, LaunchConfig, LaunchMode};
 use crate::state::{self, GuestEnvVar, ShareMount};
@@ -439,6 +440,15 @@ fn launch(options: LaunchOptions) -> Result<(), String> {
         )?,
         LaunchMode::Shell => None,
     };
+    let host_bridge_mounts = match plan.mode {
+        LaunchMode::External(_) | LaunchMode::Krunkit => host_bridge::managed_mounts(
+            &instance,
+            prepared_cloud_init
+                .as_ref()
+                .map(|prepared| prepared.hostname.as_str()),
+        )?,
+        LaunchMode::Shell => Vec::new(),
+    };
 
     if let (Some(repo), Some(branch)) = (options.repo.as_deref(), options.branch.as_deref()) {
         git::ensure_checkout(
@@ -486,6 +496,7 @@ fn launch(options: LaunchOptions) -> Result<(), String> {
         init_script_path: prepared_cloud_init
             .as_ref()
             .and_then(|prepared| prepared.init_script_path.clone()),
+        host_bridge_mounts,
         shares: instance.shares.clone(),
         guest_env: instance.guest_env.clone(),
         verbose: options.verbose,
@@ -530,6 +541,7 @@ fn exec(options: ExecOptions) -> Result<(), String> {
         .or_else(cloud_init::discover_ssh_private_key)
         .ok_or_else(missing_ssh_guidance)?;
     let vmnet = network::resolve_for_instance(&instance)?;
+    let host_bridge_mounts = host_bridge::managed_mounts(&instance, None)?;
     let launch_config = LaunchConfig {
         require_vm: true,
         cpus: runtime::default_cpus(),
@@ -540,6 +552,7 @@ fn exec(options: ExecOptions) -> Result<(), String> {
         ssh_pubkey_path: None,
         ssh_private_key_path: Some(ssh_private_key_path),
         init_script_path: None,
+        host_bridge_mounts,
         shares: instance.shares.clone(),
         guest_env: instance.guest_env.clone(),
         verbose: options.verbose,
