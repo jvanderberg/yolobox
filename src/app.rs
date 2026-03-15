@@ -8,6 +8,7 @@ use clap::error::ErrorKind;
 use clap::{ArgAction, ArgGroup, Args, CommandFactory, Parser, Subcommand};
 use petname::petname;
 use std::env;
+use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
@@ -167,6 +168,8 @@ struct LaunchOptions {
     with_claude: bool,
     #[arg(long = "with-gh", hide = true)]
     with_gh: bool,
+    #[arg(long = "with-cargo", hide = true)]
+    with_cargo: bool,
     #[arg(long = "with-ai", hide = true)]
     with_ai: bool,
     /// Disable Codex integration for this launch.
@@ -178,6 +181,9 @@ struct LaunchOptions {
     /// Disable GitHub CLI integration for this launch.
     #[arg(long = "no-gh", conflicts_with = "with_gh")]
     no_gh: bool,
+    /// Disable Cargo config and auth integration for this launch.
+    #[arg(long = "no-cargo", conflicts_with = "with_cargo")]
+    no_cargo: bool,
     /// Disable Codex, Claude, and GitHub CLI integrations for this launch.
     #[arg(long = "no-ai", conflicts_with = "with_ai")]
     no_ai: bool,
@@ -999,7 +1005,6 @@ fn build_requested_shares(
             shares.push(share);
         }
     }
-
     shares.sort();
     shares.dedup();
 
@@ -1047,6 +1052,12 @@ fn build_requested_guest_env(options: &LaunchOptions) -> Result<Option<Vec<Guest
                     .map_err(|_| "ANTHROPIC_API_KEY is not valid UTF-8".to_string())?,
             });
         }
+        if let Some(claude_json) = host_home_file_contents(".claude.json")? {
+            vars.push(GuestEnvVar {
+                name: "YOLOBOX_HOST_CLAUDE_JSON".to_string(),
+                value: claude_json,
+            });
+        }
     }
 
     if gh_enabled(options) {
@@ -1055,6 +1066,22 @@ fn build_requested_guest_env(options: &LaunchOptions) -> Result<Option<Vec<Guest
                 name: "GH_TOKEN".to_string(),
                 value: token,
             });
+        }
+    }
+
+    if cargo_enabled(options) {
+        for (path, env_name) in [
+            (".cargo/config.toml", "YOLOBOX_HOST_CARGO_CONFIG_TOML"),
+            (".cargo/credentials.toml", "YOLOBOX_HOST_CARGO_CREDENTIALS_TOML"),
+            (".cargo/credentials", "YOLOBOX_HOST_CARGO_CREDENTIALS"),
+            (".cargo/config", "YOLOBOX_HOST_CARGO_CONFIG"),
+        ] {
+            if let Some(contents) = host_home_file_contents(path)? {
+                vars.push(GuestEnvVar {
+                    name: env_name.to_string(),
+                    value: contents,
+                });
+            }
         }
     }
 
@@ -1089,6 +1116,17 @@ fn host_git_config(key: &str) -> Result<Option<String>, String> {
     } else {
         Ok(Some(value))
     }
+}
+
+fn host_home_file_contents(relative_path: &str) -> Result<Option<String>, String> {
+    let home = env::var_os("HOME").ok_or_else(|| "HOME is not set".to_string())?;
+    let path = PathBuf::from(home).join(relative_path);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    fs::read_to_string(&path)
+        .map(Some)
+        .map_err(|err| format!("failed to read {}: {err}", path.display()))
 }
 
 fn host_gh_auth_token() -> Result<Option<String>, String> {
@@ -1154,6 +1192,10 @@ fn claude_share_preference(options: &LaunchOptions) -> SharePreference {
     share_preference(options.with_claude, options.no_ai || options.no_claude)
 }
 
+fn cargo_share_preference(options: &LaunchOptions) -> SharePreference {
+    share_preference(options.with_cargo, options.no_cargo)
+}
+
 fn share_preference(explicit_enable: bool, explicit_disable: bool) -> SharePreference {
     if explicit_disable {
         SharePreference::Disabled
@@ -1170,6 +1212,10 @@ fn claude_enabled(options: &LaunchOptions) -> bool {
 
 fn gh_enabled(options: &LaunchOptions) -> bool {
     !(options.no_ai || options.no_gh)
+}
+
+fn cargo_enabled(options: &LaunchOptions) -> bool {
+    cargo_share_preference(options) != SharePreference::Disabled
 }
 
 fn is_ai_managed_share(share: &ShareMount, cloud_user: &str) -> bool {
@@ -1210,9 +1256,10 @@ fn generate_instance_name() -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BaseCommand, Cli, Command, SharePreference, claude_share_preference,
-        codex_share_preference, confirm_destroy_answer, gh_enabled, missing_base_guidance,
-        missing_ssh_guidance, missing_vm_runtime_guidance, parse_exec_env_var, render_help,
+        BaseCommand, Cli, Command, SharePreference, cargo_share_preference,
+        claude_share_preference, codex_share_preference, confirm_destroy_answer, gh_enabled,
+        missing_base_guidance, missing_ssh_guidance, missing_vm_runtime_guidance,
+        parse_exec_env_var, render_help,
     };
 
     #[test]
@@ -1251,6 +1298,7 @@ mod tests {
             Command::Launch(options) => {
                 assert_eq!(codex_share_preference(&options), SharePreference::Optional);
                 assert_eq!(claude_share_preference(&options), SharePreference::Optional);
+                assert_eq!(cargo_share_preference(&options), SharePreference::Optional);
                 assert!(gh_enabled(&options));
             }
             _ => panic!("expected launch command"),
@@ -1272,6 +1320,7 @@ mod tests {
             Command::Launch(options) => {
                 assert_eq!(codex_share_preference(&options), SharePreference::Disabled);
                 assert_eq!(claude_share_preference(&options), SharePreference::Disabled);
+                assert_eq!(cargo_share_preference(&options), SharePreference::Optional);
                 assert!(!gh_enabled(&options));
             }
             _ => panic!("expected launch command"),
@@ -1291,7 +1340,25 @@ mod tests {
             Command::Launch(options) => {
                 assert_eq!(codex_share_preference(&options), SharePreference::Disabled);
                 assert_eq!(claude_share_preference(&options), SharePreference::Disabled);
+                assert_eq!(cargo_share_preference(&options), SharePreference::Optional);
                 assert!(!gh_enabled(&options));
+            }
+            _ => panic!("expected launch command"),
+        }
+    }
+
+    #[test]
+    fn cargo_integration_can_be_opted_out_individually() {
+        let cli = Cli::parse(vec![
+            "--base".to_string(),
+            "ubuntu".to_string(),
+            "--no-cargo".to_string(),
+        ])
+        .expect("parse should succeed");
+
+        match cli.command {
+            Command::Launch(options) => {
+                assert_eq!(cargo_share_preference(&options), SharePreference::Disabled);
             }
             _ => panic!("expected launch command"),
         }
@@ -1304,6 +1371,7 @@ mod tests {
         assert!(help.contains("--no-codex"));
         assert!(help.contains("--no-claude"));
         assert!(help.contains("--no-gh"));
+        assert!(help.contains("--no-cargo"));
         assert!(help.contains("--no-enter"));
         assert!(help.contains("Prepare the instance and exit before launching or attaching to it"));
     }

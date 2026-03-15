@@ -506,6 +506,7 @@ fn launch_krunkit(instance: &Instance, config: &LaunchConfig) -> Result<i32, Str
 
     connect_ssh(
         instance,
+        config.hostname.as_deref(),
         &ssh_user,
         &ssh_private_key,
         &known_hosts,
@@ -526,6 +527,7 @@ fn exec_krunkit(
 
     exec_ssh(
         instance,
+        config.hostname.as_deref(),
         &ssh_user,
         &ssh_private_key,
         &known_hosts,
@@ -789,6 +791,7 @@ fn detect_runtime_failure(krunkit_log: &Path) -> Result<Option<String>, String> 
 
 fn connect_ssh(
     instance: &Instance,
+    guest_hostname: Option<&str>,
     ssh_user: &str,
     ssh_private_key: &Path,
     known_hosts: &Path,
@@ -798,8 +801,19 @@ fn connect_ssh(
     verbose: bool,
 ) -> Result<i32, String> {
     let interactive = true;
-    let _bridge = host_bridge::start(instance)?;
     let guest_command = guest_shell_command(&instance.id, shares, guest_env, verbose, interactive);
+    let _bridge = host_bridge::start(
+        instance,
+        build_host_bridge_session(
+            instance,
+            guest_hostname,
+            ssh_user,
+            ssh_private_key,
+            known_hosts,
+            vmnet,
+            &guest_command,
+        ),
+    )?;
     let _ = fs::write(
         instance.instance_dir.join("runtime").join("launch-debug.txt"),
         format!(
@@ -818,6 +832,7 @@ fn connect_ssh(
 
 fn exec_ssh(
     instance: &Instance,
+    guest_hostname: Option<&str>,
     ssh_user: &str,
     ssh_private_key: &Path,
     known_hosts: &Path,
@@ -827,7 +842,20 @@ fn exec_ssh(
     verbose: bool,
     guest_command: &GuestExecCommand,
 ) -> Result<i32, String> {
-    let _bridge = host_bridge::start(instance)?;
+    let interactive_guest_command =
+        guest_shell_command(&instance.id, shares, guest_env, verbose, true);
+    let _bridge = host_bridge::start(
+        instance,
+        build_host_bridge_session(
+            instance,
+            guest_hostname,
+            ssh_user,
+            ssh_private_key,
+            known_hosts,
+            vmnet,
+            &interactive_guest_command,
+        ),
+    )?;
     let mut command = ssh_base_command(ssh_user, ssh_private_key, known_hosts, vmnet, false);
     command
         .arg("-T")
@@ -842,6 +870,39 @@ fn exec_ssh(
 
     let status = command.status().map_err(|err| err.to_string())?;
     Ok(status.code().unwrap_or_default())
+}
+
+fn build_host_bridge_session(
+    instance: &Instance,
+    guest_hostname: Option<&str>,
+    ssh_user: &str,
+    ssh_private_key: &Path,
+    known_hosts: &Path,
+    vmnet: &VmnetConfig,
+    guest_command: &str,
+) -> host_bridge::HostBridgeSession {
+    let ssh_target = guest_ssh_target(instance, guest_hostname, vmnet);
+    let target_label = format!("{ssh_user}@{ssh_target}");
+    host_bridge::HostBridgeSession::new(
+        target_label.clone(),
+        format!("{} - Terminal", instance.id),
+        ssh_user.to_string(),
+        ssh_target,
+        ssh_private_key.to_path_buf(),
+        known_hosts.to_path_buf(),
+        guest_command.to_string(),
+        env::var("SSH_AUTH_SOCK").ok(),
+    )
+}
+
+fn guest_ssh_target(instance: &Instance, guest_hostname: Option<&str>, vmnet: &VmnetConfig) -> String {
+    let raw_host = guest_hostname.unwrap_or(&instance.id).trim().trim_end_matches('.');
+    let host = raw_host.strip_suffix(".local").unwrap_or(raw_host);
+    if host.is_empty() {
+        vmnet.guest_ip.clone()
+    } else {
+        format!("{host}.local")
+    }
 }
 
 fn krunkit_network_device(mac_address: &str) -> String {
@@ -1241,7 +1302,9 @@ fn guest_bootstrap_body(
         .collect::<String>();
     let bridge_path_export =
         " case \":${PATH:-}:\" in *:/yolobox/scripts:*) ;; *) export PATH=\"/yolobox/scripts:${PATH:-}\" ;; esac;";
-    let bridge_command_shims = " sudo mkdir -p /usr/local/bin; for tool in yolobox-open yolobox-open-url yolobox-paste-image code finder; do bridge_tool=\"/yolobox/scripts/$tool\"; shim_path=\"/usr/local/bin/$tool\"; if [ -x \"$bridge_tool\" ]; then if [ -L \"$shim_path\" ] || [ ! -e \"$shim_path\" ]; then sudo ln -sfn \"$bridge_tool\" \"$shim_path\"; fi; fi; done;";
+    let bridge_command_shims = " sudo mkdir -p /usr/local/bin; for tool in yolobox-open yolobox-open-url yolobox-paste-image code finder terminal; do bridge_tool=\"/yolobox/scripts/$tool\"; shim_path=\"/usr/local/bin/$tool\"; if [ -x \"$bridge_tool\" ]; then if [ -L \"$shim_path\" ] || [ ! -e \"$shim_path\" ]; then sudo ln -sfn \"$bridge_tool\" \"$shim_path\"; fi; fi; done;";
+    let cargo_config_sync = " mkdir -p \"$HOME/.cargo\"; if [ -n \"${YOLOBOX_HOST_CARGO_CONFIG_TOML:-}\" ]; then printf '%s' \"$YOLOBOX_HOST_CARGO_CONFIG_TOML\" > \"$HOME/.cargo/config.toml\"; fi; if [ -n \"${YOLOBOX_HOST_CARGO_CREDENTIALS_TOML:-}\" ]; then printf '%s' \"$YOLOBOX_HOST_CARGO_CREDENTIALS_TOML\" > \"$HOME/.cargo/credentials.toml\"; chmod 600 \"$HOME/.cargo/credentials.toml\" >/dev/null 2>&1 || true; fi; if [ -n \"${YOLOBOX_HOST_CARGO_CREDENTIALS:-}\" ]; then printf '%s' \"$YOLOBOX_HOST_CARGO_CREDENTIALS\" > \"$HOME/.cargo/credentials\"; chmod 600 \"$HOME/.cargo/credentials\" >/dev/null 2>&1 || true; fi; if [ -n \"${YOLOBOX_HOST_CARGO_CONFIG:-}\" ]; then printf '%s' \"$YOLOBOX_HOST_CARGO_CONFIG\" > \"$HOME/.cargo/config\"; fi;";
+    let claude_json_sync = " if [ -n \"${YOLOBOX_HOST_CLAUDE_JSON:-}\" ]; then printf '%s' \"$YOLOBOX_HOST_CLAUDE_JSON\" > \"$HOME/.claude.json\"; chmod 600 \"$HOME/.claude.json\" >/dev/null 2>&1 || true; fi;";
     let title_setup = if interactive {
         format!(
             " export YOLOBOX_INSTANCE_TITLE={title};",
@@ -1259,10 +1322,12 @@ fn guest_bootstrap_body(
     };
 
     format!(
-        "{cloud_init_wait} ROOT_DEV=\"$(findmnt -n -o SOURCE / 2>/dev/null || true)\"; ROOT_FS=\"$(findmnt -n -o FSTYPE / 2>/dev/null || true)\"; if command -v growpart >/dev/null 2>&1 && [ -n \"$ROOT_DEV\" ]; then PARENT_DEV=\"/dev/$(lsblk -no PKNAME \"$ROOT_DEV\" 2>/dev/null || true)\"; PART_NUM=\"$(lsblk -no PARTN \"$ROOT_DEV\" 2>/dev/null || true)\"; if [ -n \"$PARENT_DEV\" ] && [ -n \"$PART_NUM\" ]; then sudo growpart \"$PARENT_DEV\" \"$PART_NUM\" >/dev/null 2>&1 || true; fi; fi; if [ -n \"$ROOT_DEV\" ]; then case \"$ROOT_FS\" in ext2|ext3|ext4) if command -v resize2fs >/dev/null 2>&1; then sudo resize2fs \"$ROOT_DEV\" >/dev/null 2>&1 || true; fi ;; xfs) if command -v xfs_growfs >/dev/null 2>&1; then sudo xfs_growfs / >/dev/null 2>&1 || true; fi ;; esac; fi; ulimit -n {nofile_limit} >/dev/null 2>&1 || true; if [ -e /workspace ] && [ ! -d /workspace ]; then sudo rm -f /workspace; fi; sudo mkdir -p /workspace; if ! mountpoint -q /workspace; then sudo mount -t virtiofs workspace /workspace >/dev/null 2>&1 || true; fi; if [ -e /yolobox ] && [ ! -d /yolobox ]; then sudo rm -f /yolobox; fi; sudo mkdir -p /yolobox;{bridge_mounts}{share_mounts}{bridge_command_shims}{bridge_path_export}{guest_env_exports}{title_setup}{git_identity_sync} ln -sfn {workspace_path} \"$HOME/workspace\"; cd {workspace_path} 2>/dev/null || cd \"$HOME\";",
+        "{cloud_init_wait} ROOT_DEV=\"$(findmnt -n -o SOURCE / 2>/dev/null || true)\"; ROOT_FS=\"$(findmnt -n -o FSTYPE / 2>/dev/null || true)\"; if command -v growpart >/dev/null 2>&1 && [ -n \"$ROOT_DEV\" ]; then PARENT_DEV=\"/dev/$(lsblk -no PKNAME \"$ROOT_DEV\" 2>/dev/null || true)\"; PART_NUM=\"$(lsblk -no PARTN \"$ROOT_DEV\" 2>/dev/null || true)\"; if [ -n \"$PARENT_DEV\" ] && [ -n \"$PART_NUM\" ]; then sudo growpart \"$PARENT_DEV\" \"$PART_NUM\" >/dev/null 2>&1 || true; fi; fi; if [ -n \"$ROOT_DEV\" ]; then case \"$ROOT_FS\" in ext2|ext3|ext4) if command -v resize2fs >/dev/null 2>&1; then sudo resize2fs \"$ROOT_DEV\" >/dev/null 2>&1 || true; fi ;; xfs) if command -v xfs_growfs >/dev/null 2>&1; then sudo xfs_growfs / >/dev/null 2>&1 || true; fi ;; esac; fi; ulimit -n {nofile_limit} >/dev/null 2>&1 || true; if [ -e /workspace ] && [ ! -d /workspace ]; then sudo rm -f /workspace; fi; sudo mkdir -p /workspace; if ! mountpoint -q /workspace; then sudo mount -t virtiofs workspace /workspace >/dev/null 2>&1 || true; fi; if [ -e /yolobox ] && [ ! -d /yolobox ]; then sudo rm -f /yolobox; fi; sudo mkdir -p /yolobox;{bridge_mounts}{share_mounts}{bridge_command_shims}{bridge_path_export}{guest_env_exports}{cargo_config_sync}{claude_json_sync}{title_setup}{git_identity_sync} ln -sfn {workspace_path} \"$HOME/workspace\"; cd {workspace_path} 2>/dev/null || cd \"$HOME\";",
         bridge_mounts = bridge_mounts,
         bridge_command_shims = bridge_command_shims,
         bridge_path_export = bridge_path_export,
+        cargo_config_sync = cargo_config_sync,
+        claude_json_sync = claude_json_sync,
         nofile_limit = GUEST_NOFILE_LIMIT,
         title_setup = title_setup,
         workspace_path = GUEST_WORKSPACE_PATH,
@@ -1724,8 +1789,8 @@ mod tests {
         OscTitleFilter, detect_runtime_failure, encode_env_ports, guest_shell_command,
         krunkit_network_device, loading_line, parse_instance_processes, parse_vmnet_helper_processes,
         running_vm_matches_shares, share_tag, should_probe_ssh, ssh_base_command,
-        ssh_ready_timeout, stop_stale_vm, write_runtime_shares,
-        terminal_title_sequence,
+        ssh_ready_timeout, stop_stale_vm, terminal_title_sequence,
+        write_runtime_shares,
     };
     use crate::host_bridge::ManagedMount;
     use crate::network::VmnetConfig;
@@ -1768,10 +1833,20 @@ mod tests {
                 host_path: PathBuf::from("/tmp/share"),
                 guest_path: PathBuf::from("/mnt/share"),
             }],
-            &[GuestEnvVar {
-                name: "ANTHROPIC_API_KEY".to_string(),
-                value: "sk-ant-abc123".to_string(),
-            }],
+            &[
+                GuestEnvVar {
+                    name: "ANTHROPIC_API_KEY".to_string(),
+                    value: "sk-ant-abc123".to_string(),
+                },
+                GuestEnvVar {
+                    name: "YOLOBOX_HOST_CLAUDE_JSON".to_string(),
+                    value: "{\"projects\":[]}".to_string(),
+                },
+                GuestEnvVar {
+                    name: "YOLOBOX_HOST_CARGO_CONFIG_TOML".to_string(),
+                    value: "[registries.crates-io]\nprotocol = \"sparse\"\n".to_string(),
+                },
+            ],
             true,
             true,
         );
@@ -1797,7 +1872,11 @@ mod tests {
         assert!(!command.contains("tmux"));
         assert!(command.contains(&format!("mount -t virtiofs {}", share_tag(0))));
         assert!(command.contains("/mnt/share"));
+        assert!(command.contains("YOLOBOX_HOST_CARGO_CONFIG_TOML"));
+        assert!(command.contains("$HOME/.cargo/config.toml"));
         assert!(command.contains("export ANTHROPIC_API_KEY="));
+        assert!(command.contains("YOLOBOX_HOST_CLAUDE_JSON"));
+        assert!(command.contains("$HOME/.claude.json"));
         assert!(command.contains("git config --global user.name \"$GIT_AUTHOR_NAME\""));
         assert!(command.contains("git config --global user.email \"$GIT_AUTHOR_EMAIL\""));
         assert!(command.contains("cd /workspace"));

@@ -173,7 +173,7 @@ Shares are persisted with the instance -- later launches reuse them automaticall
 AI integrations are enabled by default. On launch, yolobox will try to share the host config directories for Codex, Claude, and GitHub into the guest when they exist.
 
 
-- Claude: shares `~/.claude` and exports `ANTHROPIC_API_KEY`
+- Claude: shares `~/.claude`, exports `ANTHROPIC_API_KEY`, and snapshots `~/.claude.json` into the guest on launch
 - Codex: shares `~/.codex`
 - GitHub: shares `~/.config/gh` and exports `GH_TOKEN` 
 
@@ -182,6 +182,8 @@ AI integrations are enabled by default. On launch, yolobox will try to share the
 These are `virtio-fs` mounts, so they persist like any other share. 
 
 yolobox also installs a profile script in the guest that makes `claude` run with `--dangerously-skip-permissions` and `codex` run with `--dangerously-bypass-approvals-and-sandbox` by default. Use `command claude ...` or `command codex ...` if you want the raw CLI behavior in a shell.
+
+Cargo integration is also enabled by default when host Cargo config/auth files exist. yolobox snapshots Cargo auth/config files into the guest's own `~/.cargo` without replacing the guest toolchain or mounting the host Cargo home directly. Disable that separately with `--no-cargo`.
 
 
 Shared skills and host-bridge guidance are also populated under `/yolobox/skills`.
@@ -212,6 +214,9 @@ Requests that the macOS host open a shared directory in VS Code. With no path, i
 
 `/yolobox/scripts/finder [path]`
 Requests that the macOS host open a shared directory in Finder. With no path, it uses the current guest working directory.
+
+`/yolobox/scripts/terminal`
+Requests that the macOS host open a new Terminal.app window and SSH back into the current instance at `/workspace`. Terminal.app only.
 
 These helpers do not expose arbitrary host command execution. They communicate with a host-side listener through the shared `/yolobox` runtime mount.
 

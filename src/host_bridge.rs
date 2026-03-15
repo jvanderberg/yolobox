@@ -1,4 +1,5 @@
 use crate::state::Instance;
+use base64::Engine;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
@@ -10,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const REQUEST_POLL_MILLIS: u64 = 250;
 const GUEST_BRIDGE_ROOT: &str = "/yolobox";
@@ -30,6 +31,18 @@ const BRIDGE_SKILLS_TAG: &str = "yolobox-skills";
 pub struct HostBridge {
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostBridgeSession {
+    target_label: String,
+    terminal_title: String,
+    ssh_user: String,
+    ssh_host: String,
+    ssh_private_key: PathBuf,
+    known_hosts: PathBuf,
+    guest_command: String,
+    ssh_auth_sock: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -53,6 +66,7 @@ enum RequestVerb {
     Open,
     Code,
     Finder,
+    Terminal,
     OpenUrl,
     PasteImage,
 }
@@ -124,7 +138,7 @@ pub fn managed_mounts(
         .collect()
 }
 
-pub fn start(instance: &Instance) -> Result<HostBridge, String> {
+pub fn start(instance: &Instance, session: HostBridgeSession) -> Result<HostBridge, String> {
     let host_dir = host_bridge_dir(instance);
     ensure_directory(&host_dir.join("requests"))?;
     ensure_directory(&host_dir.join("responses"))?;
@@ -132,9 +146,10 @@ pub fn start(instance: &Instance) -> Result<HostBridge, String> {
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
     let thread_instance = instance.clone();
+    let thread_session = session.clone();
     let handle = thread::spawn(move || {
         while !thread_stop.load(Ordering::Relaxed) {
-            if let Err(err) = process_pending_requests(&thread_instance) {
+            if let Err(err) = process_pending_requests(&thread_instance, &thread_session) {
                 eprintln!("yolobox host bridge error for {}: {err}", thread_instance.id);
             }
             thread::sleep(Duration::from_millis(REQUEST_POLL_MILLIS));
@@ -152,6 +167,31 @@ impl Drop for HostBridge {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
+        }
+    }
+}
+
+impl HostBridgeSession {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        target_label: String,
+        terminal_title: String,
+        ssh_user: String,
+        ssh_host: String,
+        ssh_private_key: PathBuf,
+        known_hosts: PathBuf,
+        guest_command: String,
+        ssh_auth_sock: Option<String>,
+    ) -> Self {
+        Self {
+            target_label,
+            terminal_title,
+            ssh_user,
+            ssh_host,
+            ssh_private_key,
+            known_hosts,
+            guest_command,
+            ssh_auth_sock,
         }
     }
 }
@@ -190,6 +230,10 @@ fn populate_scripts(scripts_dir: &Path) -> Result<(), String> {
     write_executable_script(
         &scripts_dir.join("finder"),
         &render_bridge_tool_script("finder"),
+    )?;
+    write_executable_script(
+        &scripts_dir.join("terminal"),
+        &render_bridge_tool_script("terminal"),
     )?;
     Ok(())
 }
@@ -280,6 +324,7 @@ You are running inside a Linux guest launched by `yolobox` on a macOS host.\n\n\
 - Use `{scripts_root}/yolobox-open <path>` to request opening a host-visible artifact.\n\
 - Use `{scripts_root}/code [path]` to open a shared host-backed directory in VS Code. With no path, it uses the current directory. This works for `/workspace`, `/yolobox`, and explicit shared mounts.\n\
 - Use `{scripts_root}/finder [path]` to open a shared host-backed directory in Finder. With no path, it uses the current directory. This works for `/workspace`, `/yolobox`, and explicit shared mounts.\n\
+- Use `{scripts_root}/terminal` to open a new Terminal.app-only host window and SSH back into this instance at `/workspace`.\n\
 - Use `{scripts_root}/yolobox-open-url <http://instance.local:port/...>` to request opening an mDNS URL on the host.\n\
 - Use `{scripts_root}/yolobox-paste-image <path>` to request importing the current host clipboard image.\n\
 - Do not use `open`, `xdg-open`, `pbpaste`, `xclip`, or other GUI/clipboard tools to reach the host directly.\n\
@@ -306,6 +351,7 @@ When you need the host to do something, prefer the narrow `yolobox-tools` comman
 - For host-visible artifacts: `/yolobox/scripts/yolobox-open /workspace/.artifacts/...`\n\
 - For shared directories in VS Code: `/yolobox/scripts/code [path]` for `/workspace`, `/yolobox`, or an explicit shared mount\n\
 - For shared directories in Finder: `/yolobox/scripts/finder [path]` for `/workspace`, `/yolobox`, or an explicit shared mount\n\
+- For a new Terminal.app host window SSHed into this instance at `/workspace`: `/yolobox/scripts/terminal`\n\
 - For guest services on the host browser: `/yolobox/scripts/yolobox-open-url http://<instance>.local:<port>`\n\
 - For host clipboard image import: `/yolobox/scripts/yolobox-paste-image /yolobox/inputs/<name>.png`\n\
 - For dev servers, give the user an mDNS URL like `http://<instance>.local:<port>` instead of `http://localhost:<port>`\n"
@@ -315,6 +361,8 @@ When you need the host to do something, prefer the narrow `yolobox-tools` comman
 fn render_bridge_tool_script(verb: &str) -> String {
     let usage = if verb == "open-url" {
         format!("usage: yolobox-{verb} <http://instance.local:port/...>")
+    } else if verb == "terminal" {
+        "usage: terminal".to_string()
     } else if verb == "code" || verb == "finder" {
         format!("usage: {verb} [directory]")
     } else {
@@ -335,6 +383,13 @@ case "$target" in
 esac
 "#
             .to_string(),
+        )
+    } else if verb == "terminal" {
+        (
+            format!(
+                "if [ \"$#\" -ne 0 ]; then\n  echo \"{usage}\" >&2\n  exit 2\nfi"
+            ),
+            format!("target=\"{GUEST_WORKSPACE_ROOT}\"\n"),
         )
     } else if verb == "code" || verb == "finder" {
         (
@@ -433,7 +488,7 @@ exit 1
     )
 }
 
-fn process_pending_requests(instance: &Instance) -> Result<(), String> {
+fn process_pending_requests(instance: &Instance, session: &HostBridgeSession) -> Result<(), String> {
     let requests_dir = host_bridge_dir(instance).join("requests");
     if !requests_dir.exists() {
         return Ok(());
@@ -445,13 +500,17 @@ fn process_pending_requests(instance: &Instance) -> Result<(), String> {
         if request_path.extension() != Some(OsStr::new("req")) {
             continue;
         }
-        process_request_file(instance, &request_path)?;
+        process_request_file(instance, session, &request_path)?;
     }
 
     Ok(())
 }
 
-fn process_request_file(instance: &Instance, request_path: &Path) -> Result<(), String> {
+fn process_request_file(
+    instance: &Instance,
+    session: &HostBridgeSession,
+    request_path: &Path,
+) -> Result<(), String> {
     let processing_path = request_path.with_extension("processing");
     if fs::rename(request_path, &processing_path).is_err() {
         return Ok(());
@@ -466,7 +525,7 @@ fn process_request_file(instance: &Instance, request_path: &Path) -> Result<(), 
     }
 
     let response = match load_request(&processing_path) {
-        Ok(request) => handle_request(instance, &request),
+        Ok(request) => handle_request(instance, session, &request),
         Err(err) => Response {
             ok: false,
             message: err,
@@ -493,6 +552,7 @@ fn load_request(path: &Path) -> Result<Request, String> {
                     "open" => RequestVerb::Open,
                     "code" => RequestVerb::Code,
                     "finder" => RequestVerb::Finder,
+                    "terminal" => RequestVerb::Terminal,
                     "open-url" => RequestVerb::OpenUrl,
                     "paste-image" => RequestVerb::PasteImage,
                     other => return Err(format!("unsupported host bridge verb {other}")),
@@ -506,7 +566,11 @@ fn load_request(path: &Path) -> Result<Request, String> {
 
     let verb = verb.ok_or_else(|| format!("request {} is missing verb", path.display()))?;
     let target = match verb {
-        RequestVerb::Open | RequestVerb::Code | RequestVerb::Finder | RequestVerb::PasteImage => {
+        RequestVerb::Open
+        | RequestVerb::Code
+        | RequestVerb::Finder
+        | RequestVerb::Terminal
+        | RequestVerb::PasteImage => {
             let guest_path =
                 path_target.ok_or_else(|| format!("request {} is missing path", path.display()))?;
             if !Path::new(&guest_path).is_absolute() {
@@ -526,11 +590,12 @@ fn load_request(path: &Path) -> Result<Request, String> {
     Ok(Request { verb, target })
 }
 
-fn handle_request(instance: &Instance, request: &Request) -> Response {
+fn handle_request(instance: &Instance, session: &HostBridgeSession, request: &Request) -> Response {
     match request.verb {
         RequestVerb::Open => handle_open_request(instance, Path::new(&request.target)),
         RequestVerb::Code => handle_code_request(instance, Path::new(&request.target)),
         RequestVerb::Finder => handle_finder_request(instance, Path::new(&request.target)),
+        RequestVerb::Terminal => handle_terminal_request(session, Path::new(&request.target)),
         RequestVerb::OpenUrl => handle_open_url_request(&request.target),
         RequestVerb::PasteImage => handle_paste_image_request(instance, Path::new(&request.target)),
     }
@@ -569,6 +634,26 @@ fn handle_finder_request(instance: &Instance, guest_path: &Path) -> Response {
         Ok(host_path) => Response {
             ok: true,
             message: format!("opened {}", host_path.display()),
+        },
+        Err(err) => Response {
+            ok: false,
+            message: err,
+        },
+    }
+}
+
+fn handle_terminal_request(session: &HostBridgeSession, guest_path: &Path) -> Response {
+    if guest_path != Path::new(GUEST_WORKSPACE_ROOT) {
+        return Response {
+            ok: false,
+            message: format!("terminal only supports {}", GUEST_WORKSPACE_ROOT),
+        };
+    }
+
+    match open_terminal_on_host(session) {
+        Ok(message) => Response {
+            ok: true,
+            message,
         },
         Err(err) => Response {
             ok: false,
@@ -813,6 +898,179 @@ fn open_code_on_host(_instance: &Instance, path: PathBuf) -> Result<PathBuf, Str
     }
 }
 
+fn open_terminal_on_host(session: &HostBridgeSession) -> Result<String, String> {
+    let script = terminal_applescript();
+    let launcher_path = write_terminal_launcher(session)?;
+    let launcher_command = format!("/bin/sh {}", shell_quote(&launcher_path.display().to_string()));
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .arg(&launcher_command)
+        .arg(&session.terminal_title)
+        .output()
+        .map_err(|err| format!("failed to launch Terminal.app: {err}"))?;
+    if output.status.success() {
+        Ok(format!("opened Terminal.app for {}", session.target_label))
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if stderr.is_empty() {
+            Err("failed to launch Terminal.app".to_string())
+        } else {
+            Err(stderr)
+        }
+    }
+}
+
+fn terminal_applescript() -> &'static str {
+    r#"on run argv
+set shellCommand to item 1 of argv
+set terminalTitle to item 2 of argv
+tell application "Terminal"
+    activate
+    set createdTab to do script shellCommand
+    repeat 20 times
+        delay 0.25
+        my applyTerminalTitle(createdTab, terminalTitle)
+    end repeat
+end tell
+return "ok"
+end run
+
+on applyTerminalTitle(targetTab, terminalTitle)
+    try
+        tell application "Terminal"
+            set title displays custom title of targetTab to true
+            set title displays device name of targetTab to false
+            set title displays shell path of targetTab to false
+            set title displays window size of targetTab to false
+            set title displays settings name of targetTab to false
+            set title displays file name of targetTab to false
+            set custom title of targetTab to terminalTitle
+        end tell
+    on error
+        try
+            tell application "Terminal"
+                set fallbackTab to selected tab of front window
+                set title displays custom title of fallbackTab to true
+                set title displays device name of fallbackTab to false
+                set title displays shell path of fallbackTab to false
+                set title displays window size of fallbackTab to false
+                set title displays settings name of fallbackTab to false
+                set title displays file name of fallbackTab to false
+                set custom title of fallbackTab to terminalTitle
+            end tell
+        end try
+    end try
+end applyTerminalTitle"#
+}
+
+fn write_terminal_launcher(session: &HostBridgeSession) -> Result<PathBuf, String> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!(
+        "yolobox-terminal-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir(&dir).map_err(|err| format!("failed to create terminal launcher dir: {err}"))?;
+    #[cfg(unix)]
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+        .map_err(|err| format!("failed to secure terminal launcher dir: {err}"))?;
+
+    let ssh_home = dir.join("home");
+    let ssh_dir = ssh_home.join(".ssh");
+    fs::create_dir(&ssh_home)
+        .map_err(|err| format!("failed to create terminal ssh home dir: {err}"))?;
+    fs::create_dir(&ssh_dir).map_err(|err| format!("failed to create terminal ssh dir: {err}"))?;
+    #[cfg(unix)]
+    fs::set_permissions(&ssh_home, fs::Permissions::from_mode(0o700))
+        .map_err(|err| format!("failed to secure terminal ssh home dir: {err}"))?;
+    #[cfg(unix)]
+    fs::set_permissions(&ssh_dir, fs::Permissions::from_mode(0o700))
+        .map_err(|err| format!("failed to secure terminal ssh dir: {err}"))?;
+
+    let ssh_config_path = ssh_dir.join("config");
+    let encoded_guest_command =
+        base64::engine::general_purpose::STANDARD.encode(session.guest_command.as_bytes());
+    let remote_script = format!("echo {encoded_guest_command} | base64 -d | /bin/sh");
+    let remote_command = format!("/bin/sh -lc {}", shell_quote(&remote_script));
+    let mut ssh_config = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&ssh_config_path)
+        .map_err(|err| format!("failed to create terminal ssh config: {err}"))?;
+    writeln!(ssh_config, "Host yolobox-terminal").map_err(|err| err.to_string())?;
+    writeln!(ssh_config, "    HostName {}", session.ssh_host).map_err(|err| err.to_string())?;
+    writeln!(ssh_config, "    User {}", session.ssh_user).map_err(|err| err.to_string())?;
+    writeln!(
+        ssh_config,
+        "    IdentityFile {}",
+        session.ssh_private_key.display()
+    )
+    .map_err(|err| err.to_string())?;
+    writeln!(ssh_config, "    IdentitiesOnly yes").map_err(|err| err.to_string())?;
+    writeln!(ssh_config, "    StrictHostKeyChecking accept-new").map_err(|err| err.to_string())?;
+    writeln!(
+        ssh_config,
+        "    UserKnownHostsFile {}",
+        session.known_hosts.display()
+    )
+    .map_err(|err| err.to_string())?;
+    writeln!(ssh_config, "    LogLevel ERROR").map_err(|err| err.to_string())?;
+    writeln!(ssh_config, "    ServerAliveInterval 30").map_err(|err| err.to_string())?;
+    writeln!(ssh_config, "    ServerAliveCountMax 3").map_err(|err| err.to_string())?;
+    writeln!(ssh_config, "    ForwardAgent yes").map_err(|err| err.to_string())?;
+    writeln!(ssh_config, "    RequestTTY force").map_err(|err| err.to_string())?;
+    writeln!(ssh_config, "    RemoteCommand {remote_command}").map_err(|err| err.to_string())?;
+    drop(ssh_config);
+    #[cfg(unix)]
+    fs::set_permissions(&ssh_config_path, fs::Permissions::from_mode(0o600))
+        .map_err(|err| format!("failed to secure terminal ssh config: {err}"))?;
+
+    let path = dir.join("launch.sh");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|err| format!("failed to create terminal launcher script: {err}"))?;
+    writeln!(file, "#!/bin/sh").map_err(|err| err.to_string())?;
+    writeln!(file, "set -eu").map_err(|err| err.to_string())?;
+    writeln!(file, "script_path=\"$0\"").map_err(|err| err.to_string())?;
+    writeln!(file, "script_dir=\"$(dirname \"$0\")\"").map_err(|err| err.to_string())?;
+    writeln!(file, "ssh_home=\"$script_dir/home\"").map_err(|err| err.to_string())?;
+    writeln!(file, "ssh_dir=\"$ssh_home/.ssh\"").map_err(|err| err.to_string())?;
+    writeln!(file, "ssh_config=\"$ssh_dir/config\"").map_err(|err| err.to_string())?;
+    writeln!(
+        file,
+        "cleanup() {{ rm -f \"$script_path\" \"$ssh_config\"; rmdir \"$ssh_dir\" 2>/dev/null || true; rmdir \"$ssh_home\" 2>/dev/null || true; rmdir \"$script_dir\" 2>/dev/null || true; }}"
+    )
+    .map_err(|err| err.to_string())?;
+    writeln!(file, "trap cleanup EXIT").map_err(|err| err.to_string())?;
+    writeln!(file, "export HOME=\"$ssh_home\"").map_err(|err| err.to_string())?;
+    if let Some(socket) = session.ssh_auth_sock.as_deref() {
+        writeln!(file, "export SSH_AUTH_SOCK={}", shell_quote(socket)).map_err(|err| err.to_string())?;
+    }
+    writeln!(file, "printf '\\033[2J\\033[3J\\033[H'").map_err(|err| err.to_string())?;
+    writeln!(
+        file,
+        "printf '\\033]0;%s\\007' {}",
+        shell_quote(&session.terminal_title)
+    )
+    .map_err(|err| err.to_string())?;
+    writeln!(file, "exec ssh -F \"$ssh_config\" yolobox-terminal")
+        .map_err(|err| err.to_string())?;
+    drop(file);
+    #[cfg(unix)]
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+        .map_err(|err| format!("failed to secure terminal launcher script: {err}"))?;
+    Ok(path)
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
 fn prepare_host_gui_command(command: &mut Command) {
     command.env_clear();
     copy_env_if_present(command, "HOME");
@@ -972,10 +1230,11 @@ end run"#;
 mod tests {
     use super::{
         GUEST_ARTIFACTS_ROOT, GUEST_INPUTS_ROOT, GUEST_REQUESTS_ROOT, GUEST_RESPONSES_ROOT,
-        GUEST_SCRIPTS_ROOT, GUEST_SKILLS_ROOT, Response, canonical_root_for_guest,
-        managed_mount_specs, managed_mounts, map_allowlisted_guest_path, render_bridge_tool_script,
-        validate_mdns_url, validate_paste_destination, validate_shared_directory_target,
-        write_response,
+        GUEST_SCRIPTS_ROOT, GUEST_SKILLS_ROOT, HostBridgeSession, Response,
+        canonical_root_for_guest, managed_mount_specs, managed_mounts, map_allowlisted_guest_path,
+        render_bridge_tool_script, terminal_applescript, validate_mdns_url,
+        validate_paste_destination, validate_shared_directory_target, write_response,
+        write_terminal_launcher,
     };
     use crate::ports::PortMapping;
     use crate::state::{Instance, ShareMount};
@@ -1017,6 +1276,7 @@ mod tests {
         assert!(root.join("instance/runtime/yolobox/inputs").is_dir());
         assert!(root.join("instance/runtime/yolobox/scripts").join("code").is_file());
         assert!(root.join("instance/runtime/yolobox/scripts").join("finder").is_file());
+        assert!(root.join("instance/runtime/yolobox/scripts").join("terminal").is_file());
         assert!(root.join("instance/runtime/yolobox/scripts").join("yolobox-open").is_file());
         assert!(root.join("instance/runtime/yolobox/scripts").join("yolobox-open-url").is_file());
         assert!(root.join("instance/runtime/yolobox/scripts").join("yolobox-paste-image").is_file());
@@ -1092,6 +1352,87 @@ mod tests {
         assert!(script.contains("target=\"$(pwd -P)\""));
         assert!(script.contains("target=\"$(cd \"$candidate\" && pwd -P)\""));
         assert!(script.contains("path=%s"));
+    }
+
+    #[test]
+    fn terminal_script_is_argument_free_and_targets_workspace() {
+        let script = render_bridge_tool_script("terminal");
+        assert!(script.contains("usage: terminal"));
+        assert!(script.contains("if [ \"$#\" -ne 0 ]; then"));
+        assert!(script.contains("target=\"/workspace\""));
+        assert!(script.contains("path=%s"));
+    }
+
+    #[test]
+    fn host_bridge_session_stores_terminal_label_and_command() {
+        let session = HostBridgeSession::new(
+            "alice@demo-host.local".to_string(),
+            "demo - Terminal".to_string(),
+            "alice".to_string(),
+            "demo-host.local".to_string(),
+            PathBuf::from("/tmp/demo/id_ed25519"),
+            PathBuf::from("/tmp/demo/known_hosts"),
+            "bash -lc 'cd /workspace && exec /bin/bash -l'".to_string(),
+            Some("/tmp/agent.sock".to_string()),
+        );
+        assert_eq!(session.target_label, "alice@demo-host.local");
+        assert_eq!(session.terminal_title, "demo - Terminal");
+        assert_eq!(session.ssh_user, "alice");
+        assert_eq!(session.ssh_host, "demo-host.local");
+        assert_eq!(session.ssh_private_key, PathBuf::from("/tmp/demo/id_ed25519"));
+        assert_eq!(session.known_hosts, PathBuf::from("/tmp/demo/known_hosts"));
+        assert!(session.guest_command.contains("/workspace"));
+        assert_eq!(session.ssh_auth_sock.as_deref(), Some("/tmp/agent.sock"));
+    }
+
+    #[test]
+    fn terminal_launcher_script_wraps_command_without_inlining_it_into_terminal() {
+        let session = HostBridgeSession::new(
+            "alice@demo-host.local".to_string(),
+            "demo - Terminal".to_string(),
+            "alice".to_string(),
+            "demo-host.local".to_string(),
+            PathBuf::from("/tmp/demo/id_ed25519"),
+            PathBuf::from("/tmp/demo/known_hosts"),
+            "bash -lc 'cd /workspace && exec /bin/bash -l'".to_string(),
+            Some("/tmp/agent.sock".to_string()),
+        );
+        let path = write_terminal_launcher(&session).unwrap();
+        let body = fs::read_to_string(&path).unwrap();
+        assert!(body.contains("trap cleanup EXIT"));
+        assert!(body.contains("printf '\\033[2J\\033[3J\\033[H'"));
+        assert!(body.contains("printf '\\033]0;%s\\007' 'demo - Terminal'"));
+        assert!(body.contains("export HOME=\"$ssh_home\""));
+        assert!(body.contains("export SSH_AUTH_SOCK='/tmp/agent.sock'"));
+        assert!(body.contains("exec ssh -F \"$ssh_config\" yolobox-terminal"));
+        let ssh_config = fs::read_to_string(path.parent().unwrap().join("home/.ssh/config")).unwrap();
+        assert!(ssh_config.contains("Host yolobox-terminal"));
+        assert!(ssh_config.contains("HostName demo-host.local"));
+        assert!(ssh_config.contains("User alice"));
+        assert!(ssh_config.contains("IdentityFile /tmp/demo/id_ed25519"));
+        assert!(ssh_config.contains("UserKnownHostsFile /tmp/demo/known_hosts"));
+        assert!(ssh_config.contains("ForwardAgent yes"));
+        assert!(ssh_config.contains("RemoteCommand /bin/sh -lc"));
+        assert!(ssh_config.contains("| base64 -d | /bin/sh"));
+        let dir = path.parent().unwrap().to_path_buf();
+        let _ = fs::remove_file(dir.join("home/.ssh/config"));
+        let _ = fs::remove_dir(dir.join("home/.ssh"));
+        let _ = fs::remove_dir(dir.join("home"));
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn terminal_applescript_sets_terminal_custom_title() {
+        let script = terminal_applescript();
+        assert!(script.contains("set terminalTitle to item 2 of argv"));
+        assert!(script.contains("set createdTab to do script shellCommand"));
+        assert!(script.contains("repeat 20 times"));
+        assert!(script.contains("my applyTerminalTitle(createdTab, terminalTitle)"));
+        assert!(script.contains("set title displays custom title of targetTab to true"));
+        assert!(script.contains("set title displays settings name of targetTab to false"));
+        assert!(script.contains("set title displays file name of targetTab to false"));
+        assert!(script.contains("set custom title of targetTab to terminalTitle"));
     }
 
     #[test]
