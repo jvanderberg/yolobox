@@ -228,6 +228,29 @@ To interact with these skills you can use prompts like:
 
 ```Take a look at the screenshot in my clipboard```
 
+### X11 Forwarding
+
+Display guest GUI applications on your Mac using XQuartz:
+
+```bash
+yolobox --repo git@github.com:org/repo.git --branch main --x11
+```
+
+This forwards X11 over SSH (`-Y`) so graphical apps launched in the guest appear on the host display. XQuartz must be installed and its "Allow connections from network clients" setting enabled in Preferences → Security.
+
+```bash
+brew install --cask xquartz
+# Log out and back in after installing
+```
+
+X11 forwarding also works with `yolobox exec`:
+
+```bash
+yolobox exec --name myrepo-main --x11 -- xclock
+```
+
+Check XQuartz availability with `yolobox doctor`.
+
 ### Init Scripts
 
 Run a first-boot script inside the guest:

@@ -70,6 +70,7 @@ pub struct LaunchConfig {
     pub guest_env: Vec<GuestEnvVar>,
     pub verbose: bool,
     pub vmnet: Option<VmnetConfig>,
+    pub x11: bool,
 }
 
 pub struct GuestExecCommand {
@@ -299,6 +300,42 @@ pub fn resolve_runtime(force_shell: bool) -> RuntimePlan {
     }
 }
 
+pub fn find_xquartz() -> bool {
+    Path::new("/Applications/Utilities/XQuartz.app").exists()
+}
+
+fn ensure_xquartz() -> Result<(), String> {
+    if !find_xquartz() {
+        return Err([
+            "--x11 requires XQuartz, which is not installed.",
+            "",
+            "Install it:",
+            "  brew install --cask xquartz",
+            "",
+            "Then log out and back in for DISPLAY to be set.",
+        ].join("\n"));
+    }
+
+    // Launch XQuartz in the background if not already running
+    let _ = Command::new("open")
+        .arg("-g")
+        .arg("-a")
+        .arg("XQuartz")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    Ok(())
+}
+
+fn resolve_x11_display() -> String {
+    // Modern macOS XQuartz does not create the traditional /tmp/.X11-unix/X0 socket.
+    // The launchd socket path it sets in DISPLAY also fails with SSH X11 forwarding.
+    // Use TCP via localhost:0 which works when XQuartz has "Allow connections from
+    // network clients" enabled in Preferences → Security.
+    "localhost:0".to_string()
+}
+
 pub fn launch(
     plan: RuntimePlan,
     instance: &Instance,
@@ -369,6 +406,9 @@ pub fn launch_summary(instance: &Instance, config: &LaunchConfig) -> Vec<String>
                 if mount.readonly { "ro" } else { "rw" }
             ));
         }
+    }
+    if config.x11 {
+        lines.push("x11: forwarding enabled via ssh -Y".to_string());
     }
     if let Some(vmnet) = &config.vmnet {
         lines.extend(vmnet.summary_lines());
@@ -514,6 +554,7 @@ fn launch_krunkit(instance: &Instance, config: &LaunchConfig) -> Result<i32, Str
         &config.shares,
         &config.guest_env,
         config.verbose,
+        config.x11,
     )
 }
 
@@ -536,6 +577,7 @@ fn exec_krunkit(
         &config.guest_env,
         config.verbose,
         guest_command,
+        config.x11,
     )
 }
 
@@ -799,7 +841,14 @@ fn connect_ssh(
     shares: &[ShareMount],
     guest_env: &[GuestEnvVar],
     verbose: bool,
+    x11: bool,
 ) -> Result<i32, String> {
+    if x11 {
+        ensure_xquartz()?;
+        // run_intercepted_command uses fork+execvp which inherits process env
+        let display = resolve_x11_display();
+        unsafe { env::set_var("DISPLAY", &display); }
+    }
     let interactive = true;
     let guest_command = guest_shell_command(&instance.id, shares, guest_env, verbose, interactive);
     let _bridge = host_bridge::start(
@@ -821,7 +870,7 @@ fn connect_ssh(
             instance.id,
         ),
     );
-    let mut command = ssh_base_command(ssh_user, ssh_private_key, known_hosts, vmnet, true);
+    let mut command = ssh_base_command(ssh_user, ssh_private_key, known_hosts, vmnet, true, x11);
     command
         .arg("-tt")
         .arg(format!("{ssh_user}@{}", vmnet.guest_ip))
@@ -841,7 +890,11 @@ fn exec_ssh(
     guest_env: &[GuestEnvVar],
     verbose: bool,
     guest_command: &GuestExecCommand,
+    x11: bool,
 ) -> Result<i32, String> {
+    if x11 {
+        ensure_xquartz()?;
+    }
     let interactive_guest_command =
         guest_shell_command(&instance.id, shares, guest_env, verbose, true);
     let _bridge = host_bridge::start(
@@ -856,7 +909,10 @@ fn exec_ssh(
             &interactive_guest_command,
         ),
     )?;
-    let mut command = ssh_base_command(ssh_user, ssh_private_key, known_hosts, vmnet, false);
+    let mut command = ssh_base_command(ssh_user, ssh_private_key, known_hosts, vmnet, false, x11);
+    if x11 {
+        command.env("DISPLAY", resolve_x11_display());
+    }
     command
         .arg("-T")
         .arg(format!("{ssh_user}@{}", vmnet.guest_ip))
@@ -1340,6 +1396,7 @@ fn ssh_base_command(
     known_hosts: &Path,
     vmnet: &VmnetConfig,
     forward_agent: bool,
+    x11: bool,
 ) -> Command {
     let mut command = Command::new("ssh");
     let _ = ssh_user;
@@ -1362,6 +1419,9 @@ fn ssh_base_command(
     if forward_agent {
         command.arg("-A");
     }
+    if x11 {
+        command.arg("-Y");
+    }
     command
 }
 
@@ -1371,7 +1431,7 @@ fn probe_ssh(
     known_hosts: &Path,
     vmnet: &VmnetConfig,
 ) -> Result<bool, String> {
-    let mut command = ssh_base_command(ssh_user, ssh_private_key, known_hosts, vmnet, false);
+    let mut command = ssh_base_command(ssh_user, ssh_private_key, known_hosts, vmnet, false, false);
     command
         .arg("-o")
         .arg("BatchMode=yes")
@@ -1968,11 +2028,13 @@ mod tests {
             PathBuf::from("/tmp/known_hosts").as_path(),
             &vmnet,
             true,
+            false,
         )
         .get_args()
         .map(OsString::from)
         .collect::<Vec<_>>();
         assert!(forwarded_args.iter().any(|arg| arg == "-A"));
+        assert!(!forwarded_args.iter().any(|arg| arg == "-Y"));
         assert!(!forwarded_args.iter().any(|arg| arg == "-L"));
 
         let probe_args = ssh_base_command(
@@ -1981,11 +2043,41 @@ mod tests {
             PathBuf::from("/tmp/known_hosts").as_path(),
             &vmnet,
             false,
+            false,
         )
         .get_args()
         .map(OsString::from)
         .collect::<Vec<_>>();
         assert!(!probe_args.iter().any(|arg| arg == "-A"));
+        assert!(!probe_args.iter().any(|arg| arg == "-Y"));
+    }
+
+    #[test]
+    fn x11_forwarding_adds_trusted_flag() {
+        let vmnet = VmnetConfig {
+            client_path: PathBuf::from("/opt/vmnet-helper/bin/vmnet-client"),
+            interface_id: "123e4567-e89b-12d3-a456-426614174000".to_string(),
+            mac_address: "52:54:de:61:b0:1f".to_string(),
+            guest_ip: "192.168.105.33".to_string(),
+            gateway_ip: "192.168.105.1".to_string(),
+            prefix_len: 24,
+            dhcp_start: "192.168.105.1".to_string(),
+            dhcp_end: "192.168.105.254".to_string(),
+            dns_servers: vec!["1.1.1.1".to_string()],
+        };
+        let x11_args = ssh_base_command(
+            "joshv",
+            PathBuf::from("/tmp/id_rsa").as_path(),
+            PathBuf::from("/tmp/known_hosts").as_path(),
+            &vmnet,
+            false,
+            true,
+        )
+        .get_args()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+        assert!(x11_args.iter().any(|arg| arg == "-Y"));
+        assert!(!x11_args.iter().any(|arg| arg == "-A"));
     }
 
     #[test]

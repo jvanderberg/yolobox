@@ -406,10 +406,10 @@ fn render_bootcmd(shares: &[ShareMount]) -> String {
 
 fn render_runcmd(user: &str, shares: &[ShareMount], includes_init_script: bool) -> String {
     let mut lines = vec![
-        "  - [ sh, -lc, \"if ! dpkg -s avahi-daemon >/dev/null 2>&1; then apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y avahi-daemon; fi\" ]".to_string(),
+        "  - [ sh, -lc, \"if ! dpkg -s avahi-daemon >/dev/null 2>&1 || ! dpkg -s xauth >/dev/null 2>&1; then apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y avahi-daemon xauth; fi\" ]".to_string(),
         "  - [ systemctl, enable, --now, avahi-daemon ]".to_string(),
         format!(
-            "  - [ sh, -lc, \"mkdir -p /home/{user} && chown {user}:{user} /home/{user}\" ]"
+            "  - [ sh, -lc, \"mkdir -p /home/{user}\" ]"
         ),
         "  - [ sh, -lc, \"if [ -e /workspace ] && [ ! -d /workspace ]; then rm -f /workspace; fi; mkdir -p /workspace; mountpoint -q /workspace || mount /workspace || true\" ]".to_string(),
         "  - [ sh, -lc, \"if [ -e /yolobox ] && [ ! -d /yolobox ]; then rm -f /yolobox; fi; mkdir -p /yolobox\" ]".to_string(),
@@ -444,6 +444,9 @@ fn render_runcmd(user: &str, shares: &[ShareMount], includes_init_script: bool) 
     lines.push(format!(
         "  - [ ln, -sfn, {}, /home/{user}/workspace ]",
         GUEST_WORKSPACE_PATH
+    ));
+    lines.push(format!(
+        "  - [ sh, -lc, \"chown {user}:{user} /home/{user}; chown -h {user}:{user} /home/{user}/workspace 2>/dev/null || true\" ]"
     ));
     lines.join("\n")
 }
@@ -599,9 +602,10 @@ mod tests {
         assert!(rendered.contains("ssh-ed25519 AAAATEST"));
         assert!(rendered.contains("rm -f /workspace"));
         assert!(rendered.contains("mkdir -p /yolobox"));
-        assert!(rendered.contains("apt-get install -y avahi-daemon"));
+        assert!(rendered.contains("apt-get install -y avahi-daemon xauth"));
         assert!(rendered.contains("systemctl, enable, --now, avahi-daemon"));
-        assert!(rendered.contains("mkdir -p /home/vibe && chown vibe:vibe /home/vibe"));
+        assert!(rendered.contains("mkdir -p /home/vibe"));
+        assert!(rendered.contains("chown vibe:vibe /home/vibe"));
         assert!(rendered.contains("path: /etc/security/limits.d/99-yolobox.conf"));
         assert!(rendered.contains("path: /etc/profile.d/yolobox-ai.sh"));
         assert!(rendered.contains("* soft nofile 65536"));
@@ -644,9 +648,10 @@ mod tests {
         assert!(rendered.contains("su, -, vibe, -c, /var/lib/yolobox/run-init.sh"));
         assert!(rendered.contains("touch /var/log/yolobox-init.log"));
         assert!(rendered.contains("sudo touch /var/lib/yolobox/init.done"));
-        assert!(rendered.contains("apt-get install -y avahi-daemon"));
+        assert!(rendered.contains("apt-get install -y avahi-daemon xauth"));
         assert!(rendered.contains("systemctl, enable, --now, avahi-daemon"));
-        assert!(rendered.contains("mkdir -p /home/vibe && chown vibe:vibe /home/vibe"));
+        assert!(rendered.contains("mkdir -p /home/vibe"));
+        assert!(rendered.contains("chown vibe:vibe /home/vibe"));
         assert!(rendered.contains("path: /etc/security/limits.d/99-yolobox.conf"));
         assert!(rendered.contains("path: /etc/profile.d/yolobox-ai.sh"));
         assert!(rendered.contains("_yolobox_restore_title()"));

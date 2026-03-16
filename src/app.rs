@@ -187,6 +187,9 @@ struct LaunchOptions {
     /// Disable Codex, Claude, and GitHub CLI integrations for this launch.
     #[arg(long = "no-ai", conflicts_with = "with_ai")]
     no_ai: bool,
+    /// Enable X11 forwarding to display guest GUI applications on the host via XQuartz.
+    #[arg(long = "x11")]
+    x11: bool,
     /// Print VM launch details and guest bootstrap progress.
     #[arg(long)]
     verbose: bool,
@@ -241,6 +244,9 @@ struct ExecOptions {
     /// Extra environment variable to export before running the command, as NAME=VALUE.
     #[arg(long = "env", value_parser = parse_exec_env_var)]
     env: Vec<GuestEnvVar>,
+    /// Enable X11 forwarding to display guest GUI applications on the host via XQuartz.
+    #[arg(long = "x11")]
+    x11: bool,
     /// Print VM launch details and guest bootstrap progress.
     #[arg(long)]
     verbose: bool,
@@ -507,6 +513,7 @@ fn launch(options: LaunchOptions) -> Result<(), String> {
         guest_env: instance.guest_env.clone(),
         verbose: options.verbose,
         vmnet,
+        x11: options.x11,
     };
 
     if options.verbose {
@@ -563,6 +570,7 @@ fn exec(options: ExecOptions) -> Result<(), String> {
         guest_env: instance.guest_env.clone(),
         verbose: options.verbose,
         vmnet: Some(vmnet),
+        x11: options.x11,
     };
     let command = GuestExecCommand {
         cwd: options.cwd.clone(),
@@ -633,6 +641,7 @@ fn doctor() -> Result<(), String> {
             .as_ref()
             .and_then(|path| cloud_init::private_key_from_public(path))
     });
+    let xquartz = runtime::find_xquartz();
 
     println!(
         "krunkit: {}",
@@ -664,6 +673,14 @@ fn doctor() -> Result<(), String> {
             .as_ref()
             .map(|path| format!("ok ({})", path.display()))
             .unwrap_or_else(|| "missing".to_string())
+    );
+    println!(
+        "xquartz: {}",
+        if xquartz {
+            "ok"
+        } else {
+            "missing (brew install --cask xquartz)"
+        }
     );
     println!(
         "builtin_vm_ready: {}",
@@ -1373,6 +1390,7 @@ mod tests {
         assert!(help.contains("--no-gh"));
         assert!(help.contains("--no-cargo"));
         assert!(help.contains("--no-enter"));
+        assert!(help.contains("--x11"));
         assert!(help.contains("Prepare the instance and exit before launching or attaching to it"));
     }
 
